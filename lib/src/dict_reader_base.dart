@@ -32,6 +32,7 @@ class DictReader {
   late int _numberWidth;
   late int _keyBlockOffset;
   late int _recordBlockOffset;
+  late bool _mdx;
   late double _version;
   late String _encoding;
   late File _dict;
@@ -39,7 +40,9 @@ class DictReader {
   late List<(int, String)> _keyList;
   late Map<String, String> header;
 
-  DictReader(this._path);
+  DictReader(this._path) {
+    _mdx = _path.substring(_path.lastIndexOf(".")) == ".mdx";
+  }
 
   init() async {
     _dict = File(_path);
@@ -47,7 +50,7 @@ class DictReader {
     _keyList = await _readKeys();
   }
 
-  Stream<(String, String)> readRecords() async* {
+  Stream<(String, dynamic)> readRecords() async* {
     RandomAccessFile f = await _dict.open();
     await f.setPosition(_recordBlockOffset);
 
@@ -61,21 +64,22 @@ class DictReader {
     await _readNumberer(f);
 
     // record block info section
-    final List<(int, int)> recordBlockLnfoList = [];
+    final List<int> recordBlockLnfoList = [];
 
     for (var i = 0; i < numRecordBlocks; i++) {
       final compressedSize = await _readNumberer(f);
-      final decompressedSize = await _readNumberer(f);
-      recordBlockLnfoList.add((compressedSize, decompressedSize));
+      // record block decompressed size
+      await _readNumberer(f);
+
+      recordBlockLnfoList.add(compressedSize);
     }
 
     // actual record block
     var offset = 0;
     var i = 0;
 
-    for (final (compressedSize, decompressedSize) in recordBlockLnfoList) {
-      final recordBlock =
-          _decodeBlock(await f.read(compressedSize), decompressedSize);
+    for (final compressedSize in recordBlockLnfoList) {
+      final recordBlock = _decodeBlock(await f.read(compressedSize));
 
       // split record block according to the offset info from key block
       while (i < _keyList.length) {
@@ -97,15 +101,8 @@ class DictReader {
 
         i += 1;
 
-        late String data;
-
-        if (_encoding == "UTF-16") {
-          data = utf16.decode(
-              recordBlock.sublist(recordStart - offset, recordEnd - offset));
-        } else {
-          data = utf8.decode(
-              recordBlock.sublist(recordStart - offset, recordEnd - offset));
-        }
+        final data = _treatRecordData(
+            recordBlock.sublist(recordStart - offset, recordEnd - offset));
 
         yield (keyText, data);
       }
@@ -116,7 +113,7 @@ class DictReader {
     await f.close();
   }
 
-  List<int> _decodeBlock(List<int> block, int decompressedSize) {
+  List<int> _decodeBlock(List<int> block) {
     final byteBuffer =
         ByteData.view(Uint8List.fromList(block).sublist(0, 4).buffer);
     final info = byteBuffer.getUint32(0, Endian.little);
@@ -137,13 +134,13 @@ class DictReader {
   }
 
   List<(int, String)> _decodeKeyBlock(
-      List<int> keyBlockCompressed, List<(int, int)> keyBlockInfoList) {
+      List<int> keyBlockCompressed, List<int> keyBlockInfoList) {
     final List<(int, String)> keyList = [];
     var i = 0;
 
-    for (final (compressedSize, decompressedSize) in keyBlockInfoList) {
-      final keyBlock = _decodeBlock(
-          keyBlockCompressed.sublist(i, i + compressedSize), decompressedSize);
+    for (final compressedSize in keyBlockInfoList) {
+      final keyBlock =
+          _decodeBlock(keyBlockCompressed.sublist(i, i + compressedSize));
       keyList.addAll(_splitKeyBlock(keyBlock));
       i += compressedSize;
     }
@@ -151,7 +148,7 @@ class DictReader {
     return keyList;
   }
 
-  List<(int, int)> _decodeKeyBlockInfo(List<int> keyBlockInfoCompressed) {
+  List<int> _decodeKeyBlockInfo(List<int> keyBlockInfoCompressed) {
     late List<int> keyBlockInfo;
 
     if (_version >= 2.0) {
@@ -160,7 +157,7 @@ class DictReader {
       keyBlockInfo = keyBlockInfoCompressed;
     }
 
-    final List<(int, int)> keyBlockInfoList = [];
+    final List<int> keyBlockInfoList = [];
 
     var byteWidth = 1;
     var textTerm = 0;
@@ -205,12 +202,11 @@ class DictReader {
           _numberWidth);
       i += _numberWidth;
       // key block decompressed size
-      final keyBlockDecompressedSize = _readNumber(
-          Uint8List.fromList(keyBlockInfo.sublist(i, i + _numberWidth)),
+      _readNumber(Uint8List.fromList(keyBlockInfo.sublist(i, i + _numberWidth)),
           _numberWidth);
       i += _numberWidth;
 
-      keyBlockInfoList.add((keyBlockCompressedSize, keyBlockDecompressedSize));
+      keyBlockInfoList.add(keyBlockCompressedSize);
     }
 
     return keyBlockInfoList;
@@ -265,9 +261,9 @@ class DictReader {
     //   style_end    # or ''
     // store stylesheet in dict in the form of
     // {'number' : ('style_begin', 'style_end')}
-    final stylesheet = tags["StyleSheet"];
-    if (stylesheet != null) {
-      final lines = LineSplitter().convert(stylesheet);
+    final stylesheetString = tags["StyleSheet"];
+    if (stylesheetString != null) {
+      final lines = LineSplitter().convert(stylesheetString);
       for (int i = 0; i < lines.length; i += 3) {
         _stylesheet[lines[i]] = (lines[i + 1], lines[i + 2]);
       }
@@ -275,7 +271,7 @@ class DictReader {
 
     // before version 2.0, number is 4 bytes integer
     // version 2.0 and above uses 8 bytes
-    _version = double.parse(tags["GeneratedByEngineVersion"] as String);
+    _version = double.parse(tags["GeneratedByEngineVersion"]!);
     if (_version < 2.0) {
       _numberWidth = 4;
     } else {
@@ -315,7 +311,7 @@ class DictReader {
     }
 
     final bytes = await f.read(keyBlockInfoSize);
-    List<(int, int)> keyBlockInfoList = _decodeKeyBlockInfo(bytes);
+    List<int> keyBlockInfoList = _decodeKeyBlockInfo(bytes);
 
     // read key block
     final List<int> keyBlockCompressed = List.from(await f.read(keyBlockSize));
@@ -386,5 +382,48 @@ class DictReader {
     }
 
     return keyList;
+  }
+
+  String _substituteStylesheet(String txt) {
+    // substitute stylesheet definition
+    RegExp regExp = RegExp(r'`\d+`');
+    List<String> txtList = txt.split(regExp);
+    Iterable<Match> matches = regExp.allMatches(txt);
+    List<String> txtTags = matches.map((match) => match.group(0)!).toList();
+    var txtStyled = txtList[0];
+
+    for (var i = 0; i < txtList.length - 1; i++) {
+      final p = txtList.sublist(1)[i];
+      final txtTag = txtTags[i];
+      final style = _stylesheet[txtTag.substring(1, txtTag.length)];
+
+      if (p != "" && p[p.length] == "\n") {
+        txtStyled = "$txtStyled${style!.$1}${p.trimRight()}${style.$1}\r\n";
+      } else {
+        txtStyled = "$txtStyled${style!.$1}$p${style.$1}";
+      }
+    }
+
+    return txtStyled;
+  }
+
+  dynamic _treatRecordData(List<int> data) {
+    late dynamic dataReturned;
+
+    if (_mdx) {
+      if (_encoding == "UTF-16") {
+        dataReturned = utf16.decode(data);
+      } else {
+        dataReturned = utf8.decode(data);
+      }
+
+      if (_stylesheet.isNotEmpty) {
+        dataReturned = _substituteStylesheet(dataReturned);
+      }
+    } else {
+      dataReturned = data;
+    }
+
+    return dataReturned;
   }
 }
