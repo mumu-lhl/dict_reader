@@ -22,7 +22,7 @@ int _readNumber(Uint8List buffer, int numberWidth, [int start = 0]) {
   }
 }
 
-/// For querying, getting
+/// Reading MDX/MDD files.
 class DictReader {
   final String _path;
   final Map<String, (String, String)> _stylesheet = {};
@@ -35,20 +35,26 @@ class DictReader {
   late double _version;
   late String _encoding;
   late File _dict;
+  late List<(int, String)> _keyList;
 
-  late List<(int, String)> keyList;
   late Map<String, String> header;
 
+  /// [_path] File path
   DictReader(this._path) {
     _mdx = _path.substring(_path.lastIndexOf(".")) == ".mdx";
   }
 
+  /// Initialize
   init() async {
     _dict = File(_path);
     header = await _readHeader();
-    keyList = await _readKeys();
+    _keyList = await _readKeys();
   }
 
+  /// Reads records
+  ///
+  /// Returns `Stream<(String, String)` when file format is mdx.
+  /// Returns `Stream<(String, List<int>)` when file format is mdd.
   Stream<(String, dynamic)> read() async* {
     RandomAccessFile f = await _dict.open();
     await f.setPosition(_recordBlockOffset);
@@ -81,8 +87,8 @@ class DictReader {
       final recordBlock = _decodeBlock(await f.read(compressedSize));
 
       // split record block according to the offset info from key block
-      while (i < keyList.length) {
-        final (recordStart, keyText) = keyList[i];
+      while (i < _keyList.length) {
+        final (recordStart, keyText) = _keyList[i];
 
         // reach the end of current record block
         if (recordStart - offset >= recordBlock.length) {
@@ -92,8 +98,8 @@ class DictReader {
         // record end index
         late int recordEnd;
 
-        if (i < keyList.length - 1) {
-          recordEnd = keyList[i + 1].$1;
+        if (i < _keyList.length - 1) {
+          recordEnd = _keyList[i + 1].$1;
         } else {
           recordEnd = recordBlock.length + offset;
         }
