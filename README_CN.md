@@ -1,14 +1,14 @@
 # Dict_reader
 
-Reading mdict files, support MDX/MDD file formats.
+读取 mdict 文件，支持 MDX/MDD 文件格式。
 
-## Install
+## 安装
 
 ```sh
 dart pub add dict_reader
 ```
 
-## Usage
+## 使用
 
 ```dart
 import 'package:dict_reader/dict_reader.dart';
