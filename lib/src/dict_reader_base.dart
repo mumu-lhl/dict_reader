@@ -45,12 +45,19 @@ class DictReader {
   }
 
   /// Initialize
+  ///
+  /// Will not read key if [readKey] is false to reduce initialization time.
   init([bool readKey = true]) async {
     _dict = File(_path);
     header = await _readHeader();
     if (readKey) _keyList = await _readKeys();
   }
 
+  /// Only reads one record.
+  ///
+  /// [offset], [startOffset], [endOffset], [compressedSize] are obtained from [read].
+  /// Returns String if file format is mdx.
+  /// Returns List<int> if file format is mdd.
   dynamic readOne(
       int offset, int startOffset, int endOffset, int compressedSize) async {
     RandomAccessFile f = await _dict.open();
@@ -66,8 +73,15 @@ class DictReader {
 
   /// Reads records
   ///
+  /// If [returnData] is false.
+  /// Returns `Stream<(String, (int, int, int, int))>`.
+  /// `(int, int, int, int)` can be passed to [readOne] in turn.
+  ///
+  /// If [returnData] is true.
   /// Returns `Stream<(String, String)` when file format is mdx.
   /// Returns `Stream<(String, List<int>)` when file format is mdd.
+  ///
+  /// The first member of the returned record is the key text.
   Stream<(String, dynamic)> read([bool returnData = false]) async* {
     RandomAccessFile f = await _dict.open();
     await f.setPosition(_recordBlockOffset);
