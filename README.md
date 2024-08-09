@@ -2,6 +2,14 @@
 
 Reading mdict files, support MDX/MDD file formats.
 
+## Disadvantages
+
+These drawbacks don't affect general use :)
+
+* checksum ❌
+* lzo compression ❌
+* 3.0 version format ❌
+
 ## Install
 
 ```sh
