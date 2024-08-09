@@ -4,7 +4,7 @@ version: 1.0.0
 repository: https://github.com/mumu-lhl/dict_reader
 
 environment:
-  sdk: ^3.4.4
+  sdk: ^3.5.0
 
 dev_dependencies:
   lints: ^4.0.0
