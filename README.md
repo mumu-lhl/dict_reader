@@ -1,5 +1,7 @@
 # Dict_reader
 
+English | [中文](./README_CN.md)
+
 Reading mdict files, support MDX/MDD file formats.
 
 ## Disadvantages
