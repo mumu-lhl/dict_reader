@@ -16,8 +16,7 @@ dart pub add dict_reader
 import 'package:dict_reader/dict_reader.dart';
 
 void main() async {
-  final dictReader =
-      DictReader("MDX FILE PATH");
+  final dictReader = DictReader("MDX FILE PATH");
   await dictReader.init();
 
   await for (final (keyText, data) in dictReader.read(true)) {
@@ -32,8 +31,7 @@ void main() async {
 import 'package:dict_reader/dict_reader.dart';
 
 void main() async {
-  final dictReader =
-      DictReader("MDX FILE PATH");
+  final dictReader = DictReader("MDX FILE PATH");
   await dictReader.init();
 
   final map = <String, (int, int, int, int)>{};
@@ -56,8 +54,7 @@ import 'package:dict_reader/dict_reader.dart';
 void main() async {
   // ...
 
-  final dictReader =
-      DictReader("MDX FILE PATH");
+  final dictReader = DictReader("MDX FILE PATH");
   // Pass false to reduce initialization time
   await dictReader.init(false);
 
