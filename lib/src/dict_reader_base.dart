@@ -45,17 +45,30 @@ class DictReader {
   }
 
   /// Initialize
-  init() async {
+  init([bool readKey = true]) async {
     _dict = File(_path);
     header = await _readHeader();
-    _keyList = await _readKeys();
+    if (readKey) _keyList = await _readKeys();
+  }
+
+  dynamic readOne(
+      int offset, int startOffset, int endOffset, int compressedSize) async {
+    RandomAccessFile f = await _dict.open();
+    await f.setPosition(offset);
+
+    final recordBlock = _decodeBlock(await f.read(compressedSize));
+    final data = _treatRecordData(recordBlock.sublist(startOffset, endOffset));
+
+    await f.close();
+
+    return data;
   }
 
   /// Reads records
   ///
   /// Returns `Stream<(String, String)` when file format is mdx.
   /// Returns `Stream<(String, List<int>)` when file format is mdd.
-  Stream<(String, dynamic)> read() async* {
+  Stream<(String, dynamic)> read([bool returnData = false]) async* {
     RandomAccessFile f = await _dict.open();
     await f.setPosition(_recordBlockOffset);
 
@@ -82,6 +95,7 @@ class DictReader {
     // actual record block
     var offset = 0;
     var i = 0;
+    var recordBlockOffset = await f.position();
 
     for (final compressedSize in recordBlockLnfoList) {
       final recordBlock = _decodeBlock(await f.read(compressedSize));
@@ -106,13 +120,23 @@ class DictReader {
 
         i += 1;
 
-        final data = _treatRecordData(
-            recordBlock.sublist(recordStart - offset, recordEnd - offset));
+        if (returnData) {
+          final data = _treatRecordData(
+              recordBlock.sublist(recordStart - offset, recordEnd - offset));
 
-        yield (keyText, data);
+          yield (keyText, data);
+        } else {
+          final startOffset = recordStart - offset;
+          final endOffset = recordEnd - offset;
+          yield (
+            keyText,
+            (recordBlockOffset, startOffset, endOffset, compressedSize)
+          );
+        }
       }
 
       offset += recordBlock.length;
+      recordBlockOffset += compressedSize;
     }
 
     await f.close();
