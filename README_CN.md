@@ -1,5 +1,7 @@
 # Dict_reader
 
+![Pub Version](https://img.shields.io/pub/v/dict_reader)
+
 [English](./README.md) | 中文
 
 读取 mdict 文件，支持 MDX/MDD 文件格式。
