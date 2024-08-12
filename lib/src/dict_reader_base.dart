@@ -419,10 +419,14 @@ class DictReader {
           keyBlock.sublist(keyStartIndex + _numberWidth, keyEndIndex);
       late String keyText;
 
-      if (_encoding == "UTF-16") {
+      if (_encoding == "UTF-16" && _mdx) {
         keyText = utf16.decode(keyEncoded);
       } else {
         keyText = utf8.decode(keyEncoded);
+      }
+
+      if (!_mdx) {
+        keyText = keyText.replaceFirst(r"\", "");
       }
 
       keyStartIndex = keyEndIndex + width;
