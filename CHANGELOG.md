@@ -3,6 +3,22 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [1.0.1](https://github.com/cocogitto/cocogitto/compare/v1.0.0..v1.0.1) - 2024-08-12
+
+### Bug Fixes
+
+- encoding should be UTF-16 when file format is mdd - ([be03206](https://github.com/cocogitto/cocogitto/commit/be03206d9142b9bc98f8a53fc1b5ec1c586e0fe6)) - Mumulhl
+
+### Documentation
+
+- add badge - ([e2f5dfb](https://github.com/cocogitto/cocogitto/commit/e2f5dfb8daa78df81f9b19f8e06cc2ef23532b35)) - Mumulhl
+
+### Miscellaneous Chores
+
+- release v1.0.0 - ([8855a72](https://github.com/cocogitto/cocogitto/commit/8855a72e79946fae7ee3b8b60fb1ccfee807194a)) - Mumulhl
+- add publish workflow - ([3ecf942](https://github.com/cocogitto/cocogitto/commit/3ecf942ad14e4eb056735bd1dd650487a5392ed1)) - Mumulhl
+
+---
 ## [1.0.0] - 2024-08-09
 
 ### Documentation
