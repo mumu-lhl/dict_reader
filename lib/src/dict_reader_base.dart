@@ -291,7 +291,11 @@ class DictReader {
     final tags = _parseHeader(content);
 
     String? encoding = tags["Encoding"];
-    encoding ??= "UTF-8";
+    if (_mdx) {
+      encoding ??= "UTF-8";
+    } else {
+      encoding ??= "UTF-16";
+    }
     // GB18030 > GBK > GB2312
     if (["GBK", "GB2312"].contains(encoding)) {
       encoding = "GB18030";
