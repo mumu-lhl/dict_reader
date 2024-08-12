@@ -46,7 +46,7 @@ footer = """
 trim = true
 # postprocessors
 postprocessors = [
-    { pattern = '\$REPO', replace = "https://github.com/cocogitto/cocogitto" }, # replace repository URL
+    { pattern = '\$REPO', replace = "https://github.com/mumu-lhl/dict_reader" }, # replace repository URL
 ]
 
 [git]
@@ -58,7 +58,7 @@ filter_unconventional = true
 split_commits = false
 # regex for preprocessing the commit messages
 commit_preprocessors = [
-    # { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](https://github.com/orhun/git-cliff/issues/${2}))"}, # replace issue numbers
+    { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](https://github.com/mumu-lhl/dict_reader/issues/${2}))"}, # replace issue numbers
 ]
 # regex for parsing and grouping commits
 commit_parsers = [
