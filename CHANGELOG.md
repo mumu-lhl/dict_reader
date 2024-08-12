@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [1.0.2](https://github.com/cocogitto/cocogitto/compare/v1.0.1..v1.0.2) - 2024-08-12
+
+### Bug Fixes
+
+- encoding should be UTF-16 when file format is mdd - ([efffc04](https://github.com/cocogitto/cocogitto/commit/efffc047195e3821a28a52d25aeff0d89ff33ec8)) - Mumulhl
+- read mdd format - ([4adc203](https://github.com/cocogitto/cocogitto/commit/4adc203166b2d7f7460696316b6d1126ca8bbae1)) - Mumulhl
+
+### Miscellaneous Chores
+
+- add dart workflow - ([015e02a](https://github.com/cocogitto/cocogitto/commit/015e02aa372145af21063f80f901cfedcef678a0)) - Mumulhl
+
+---
 ## [1.0.1](https://github.com/cocogitto/cocogitto/compare/v1.0.0..v1.0.1) - 2024-08-12
 
 ### Bug Fixes
@@ -17,6 +29,7 @@ All notable changes to this project will be documented in this file. See [conven
 
 - release v1.0.0 - ([8855a72](https://github.com/cocogitto/cocogitto/commit/8855a72e79946fae7ee3b8b60fb1ccfee807194a)) - Mumulhl
 - add publish workflow - ([3ecf942](https://github.com/cocogitto/cocogitto/commit/3ecf942ad14e4eb056735bd1dd650487a5392ed1)) - Mumulhl
+- release v1.0.1 - ([61c216d](https://github.com/cocogitto/cocogitto/commit/61c216dd663924af4c5d5662a9b246e67828bc42)) - Mumulhl
 
 ---
 ## [1.0.0] - 2024-08-09

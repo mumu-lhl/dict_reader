@@ -1,6 +1,6 @@
 name: dict_reader
 description: Reading mdict files, support MDX/MDD file formats.
-version: 1.0.1
+version: 1.0.2
 repository: https://github.com/mumu-lhl/dict_reader
 
 environment:
