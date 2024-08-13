@@ -124,7 +124,7 @@ class DictReader {
         }
 
         // record end index
-        late int recordEnd;
+        int recordEnd;
 
         if (i < _keyList.length - 1) {
           recordEnd = _keyList[i + 1].$1;
@@ -163,7 +163,7 @@ class DictReader {
     final compressionMethod = info & 0xf;
     final data = block.sublist(8);
 
-    late List<int> decompressedBlock;
+    List<int> decompressedBlock;
 
     if (compressionMethod == 0) {
       decompressedBlock = data;
@@ -192,7 +192,7 @@ class DictReader {
   }
 
   List<int> _decodeKeyBlockInfo(List<int> keyBlockInfoCompressed) {
-    late List<int> keyBlockInfo;
+    List<int> keyBlockInfo;
 
     if (_version >= 2.0) {
       keyBlockInfo = zlib.decode(keyBlockInfoCompressed.sublist(8));
@@ -417,7 +417,7 @@ class DictReader {
 
       final keyEncoded =
           keyBlock.sublist(keyStartIndex + _numberWidth, keyEndIndex);
-      late String keyText;
+      String keyText;
 
       if (_encoding == "UTF-16" && _mdx) {
         keyText = utf16.decode(keyEncoded);
@@ -461,7 +461,7 @@ class DictReader {
   }
 
   dynamic _treatRecordData(List<int> data) {
-    late dynamic dataReturned;
+    dynamic dataReturned;
 
     if (_mdx) {
       if (_encoding == "UTF-16") {
