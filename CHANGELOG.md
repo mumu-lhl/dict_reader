@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [1.0.4](https://github.com/mumu-lhl/dict_reader/compare/v1.0.3..v1.0.4) - 2024-08-13
+
+### Bug Fixes
+
+- WTF bug when file format is mdd - ([c209a40](https://github.com/mumu-lhl/dict_reader/commit/c209a401167cadcbc802cbb18c15bb92805c1c87)) - Mumulhl
+
+### Style
+
+- remove useless late - ([a1a0002](https://github.com/mumu-lhl/dict_reader/commit/a1a000266fc3ecbd71cfc7cf52e3813cd4dc1189)) - Mumulhl
+
+---
 ## [1.0.3](https://github.com/mumu-lhl/dict_reader/compare/v1.0.2..v1.0.3) - 2024-08-12
 
 ### Bug Fixes
@@ -12,6 +23,7 @@ All notable changes to this project will be documented in this file. See [conven
 ### Miscellaneous Chores
 
 - regenerate CHANGELOG - ([8c94597](https://github.com/mumu-lhl/dict_reader/commit/8c94597f7af4ca9112d3738ce38eb56905e1429f)) - Mumulhl
+- release v1.0.3 - ([9926647](https://github.com/mumu-lhl/dict_reader/commit/992664792aa9ade40cff5a99b94b38070c27a56e)) - Mumulhl
 
 ---
 ## [1.0.2](https://github.com/mumu-lhl/dict_reader/compare/v1.0.1..v1.0.2) - 2024-08-12
