@@ -426,6 +426,15 @@ class DictReader {
       }
 
       if (!_mdx) {
+        var temp = "";
+        for (var i = 0; i < keyText.length; i += 2) {
+          temp += keyText[i];
+        }
+
+        keyText = temp;
+      }
+
+      if (!_mdx) {
         keyText = keyText.replaceFirst(r"\", "");
       }
 
