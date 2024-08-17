@@ -11,9 +11,9 @@ Reading mdict files, support MDX/MDD file formats.
 These drawbacks don't affect general use :)
 
 * checksum ❌
-* Encrypted ❌
 * lzo compression ❌
 * 3.0 version format ❌
+* record block encrypted ❌
 
 ## Install
 

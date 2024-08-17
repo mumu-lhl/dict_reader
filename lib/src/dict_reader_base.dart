@@ -2,7 +2,24 @@ import "dart:convert";
 import "dart:io";
 import "dart:typed_data";
 
+import "package:blockchain_utils/crypto/crypto/hash/hash.dart";
 import "package:charset/charset.dart";
+
+Uint8List _fastDecrypt(Uint8List data, Uint8List key) {
+  // XOR decryption
+  final b = data;
+  final keyLength = key.length;
+  int previous = 0x36;
+
+  for (int i = 0; i < b.length; i++) {
+    int t = (b[i] >> 4 | b[i] << 4) & 0xff;
+    t = t ^ previous ^ (i & 0xff) ^ key[i % keyLength];
+    previous = b[i];
+    b[i] = t;
+  }
+
+  return b;
+}
 
 int _readByte(Uint8List buffer, int byteWidth, [int start = 0]) {
   final byteBuffer = ByteData.view(buffer.buffer);
@@ -36,6 +53,7 @@ class DictReader {
   late String _encoding;
   late File _dict;
   late List<(int, String)> _keyList;
+  late int _encrypt;
 
   late Map<String, String> header;
 
@@ -51,24 +69,6 @@ class DictReader {
     _dict = File(_path);
     header = await _readHeader();
     if (readKey) _keyList = await _readKeys();
-  }
-
-  /// Only reads one record.
-  ///
-  /// [offset], [startOffset], [endOffset], [compressedSize] are obtained from [read].
-  /// Returns String if file format is mdx.
-  /// Returns List<int> if file format is mdd.
-  dynamic readOne(
-      int offset, int startOffset, int endOffset, int compressedSize) async {
-    RandomAccessFile f = await _dict.open();
-    await f.setPosition(offset);
-
-    final recordBlock = _decodeBlock(await f.read(compressedSize));
-    final data = _treatRecordData(recordBlock.sublist(startOffset, endOffset));
-
-    await f.close();
-
-    return data;
   }
 
   /// Reads records
@@ -156,6 +156,24 @@ class DictReader {
     await f.close();
   }
 
+  /// Only reads one record.
+  ///
+  /// [offset], [startOffset], [endOffset], [compressedSize] are obtained from [read].
+  /// Returns String if file format is mdx.
+  /// Returns List<int> if file format is mdd.
+  dynamic readOne(
+      int offset, int startOffset, int endOffset, int compressedSize) async {
+    RandomAccessFile f = await _dict.open();
+    await f.setPosition(offset);
+
+    final recordBlock = _decodeBlock(await f.read(compressedSize));
+    final data = _treatRecordData(recordBlock.sublist(startOffset, endOffset));
+
+    await f.close();
+
+    return data;
+  }
+
   List<int> _decodeBlock(List<int> block) {
     final byteBuffer =
         ByteData.view(Uint8List.fromList(block).sublist(0, 4).buffer);
@@ -195,6 +213,14 @@ class DictReader {
     List<int> keyBlockInfo;
 
     if (_version >= 2.0) {
+      if (_encrypt == 2) {
+        final key = RIPEMD128
+            .hash(keyBlockInfoCompressed.sublist(4, 8) + [149, 54, 0, 0]);
+        keyBlockInfoCompressed = keyBlockInfoCompressed.sublist(0, 8) +
+            _fastDecrypt(Uint8List.fromList(keyBlockInfoCompressed.sublist(8)),
+                Uint8List.fromList(key));
+      }
+
       keyBlockInfo = zlib.decode(keyBlockInfoCompressed.sublist(8));
     } else {
       keyBlockInfo = keyBlockInfoCompressed;
@@ -303,6 +329,18 @@ class DictReader {
       encoding = "GB18030";
     }
     _encoding = encoding;
+
+    // encryption flag
+    //   0x00 - no encryption, "Allow export to text" is checked in MdxBuilder 3.
+    //   0x01 - encrypt record block, "Encryption Key" is given in MdxBuilder 3.
+    //   0x02 - encrypt key info block, "Allow export to text" is unchecked in MdxBuilder 3.
+    if (!tags.containsKey("Encrypted") || tags["Encrypted"] == "No") {
+      _encrypt = 0;
+    } else if (tags["Encrypted"] == "Yes") {
+      _encrypt = 1;
+    } else {
+      _encrypt = 2;
+    }
 
     // stylesheet attribute if present takes form of:
     //   style_number # 1-255
