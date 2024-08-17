@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [1.1.1](https://github.com/mumu-lhl/dict_reader/compare/v1.1.0..v1.1.1) - 2024-08-17
+
+### Bug Fixes
+
+- read Encrypted error - ([518ec9a](https://github.com/mumu-lhl/dict_reader/commit/518ec9a82a2fc4a6941343cfe872777f4b175667)) - Mumulhl
+
+---
 ## [1.1.0](https://github.com/mumu-lhl/dict_reader/compare/v1.0.4..v1.1.0) - 2024-08-17
 
 ### Documentation
