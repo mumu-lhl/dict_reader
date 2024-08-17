@@ -339,7 +339,7 @@ class DictReader {
     } else if (tags["Encrypted"] == "Yes") {
       _encrypt = 1;
     } else {
-      _encrypt = 2;
+      _encrypt = int.parse(tags["Encrypted"]!);
     }
 
     // stylesheet attribute if present takes form of:
