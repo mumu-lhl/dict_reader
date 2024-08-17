@@ -3,11 +3,31 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [1.1.0](https://github.com/mumu-lhl/dict_reader/compare/v1.0.4..v1.1.0) - 2024-08-17
+
+### Documentation
+
+- add disadvantage - ([32f93ab](https://github.com/mumu-lhl/dict_reader/commit/32f93abffc247227031b1a028c24901951dd08bd)) - Mumulhl
+- move usage to example - ([3502cf6](https://github.com/mumu-lhl/dict_reader/commit/3502cf6378aefc4c357f80926d2d0579edc8710e)) - Mumulhl
+
+### Features
+
+- support key info encrypted - ([83c07e2](https://github.com/mumu-lhl/dict_reader/commit/83c07e268e621a59bda6cf98cc1638d4661ffc15)) - Mumulhl
+
+### Miscellaneous Chores
+
+- add more description - ([c4731e7](https://github.com/mumu-lhl/dict_reader/commit/c4731e794f93ae7d046436611d45d2a1919881f8)) - Mumulhl
+
+---
 ## [1.0.4](https://github.com/mumu-lhl/dict_reader/compare/v1.0.3..v1.0.4) - 2024-08-13
 
 ### Bug Fixes
 
 - WTF bug when file format is mdd - ([c209a40](https://github.com/mumu-lhl/dict_reader/commit/c209a401167cadcbc802cbb18c15bb92805c1c87)) - Mumulhl
+
+### Miscellaneous Chores
+
+- release v1.0.4 - ([330a1e8](https://github.com/mumu-lhl/dict_reader/commit/330a1e81e0a1a0971c6b7dee02ac623921b7f7ac)) - Mumulhl
 
 ### Style
 
