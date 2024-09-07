@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [1.1.2](https://github.com/mumu-lhl/dict_reader/compare/v1.1.1..v1.1.2) - 2024-09-07
+
+### Miscellaneous Chores
+
+- reduce the version of the environment needed - ([97fc9c1](https://github.com/mumu-lhl/dict_reader/commit/97fc9c1a6227b9a78e5edd2ff9ab5965a3f8d0c0)) - Mumulhl
+
+---
 ## [1.1.1](https://github.com/mumu-lhl/dict_reader/compare/v1.1.0..v1.1.1) - 2024-08-17
 
 ### Bug Fixes
