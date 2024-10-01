@@ -457,23 +457,17 @@ class DictReader {
           keyBlock.sublist(keyStartIndex + _numberWidth, keyEndIndex);
       String keyText;
 
-      if (_encoding == "UTF-16" && _mdx) {
+      if (_encoding == "UTF-16") {
         keyText = Utf16Decoder().decodeUtf16Le(keyEncoded);
+
+        if (!_mdx) {
+          keyText = keyText.replaceAll("\\", "/");
+          if (keyText[0] == "/") {
+            keyText = keyText.substring(1);
+          }
+        }
       } else {
         keyText = utf8.decode(keyEncoded);
-      }
-
-      if (!_mdx) {
-        var temp = "";
-        for (var i = 0; i < keyText.length; i += 2) {
-          temp += keyText[i];
-        }
-
-        keyText = temp;
-      }
-
-      if (!_mdx) {
-        keyText = keyText.replaceFirst(r"\", "");
       }
 
       keyStartIndex = keyEndIndex + width;
