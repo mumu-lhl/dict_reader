@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [1.1.3](https://github.com/mumu-lhl/dict_reader/compare/v1.1.2..v1.1.3) - 2024-10-01
+
+### Bug Fixes
+
+- fix UTF-16 decode - ([734f47c](https://github.com/mumu-lhl/dict_reader/commit/734f47cf652c54d59e04f0de722d3a830cb76d2a)) - Mumulhl
+
+### Miscellaneous Chores
+
+- **(deps)** bump lints from 4.0.0 to 5.0.0 ([#1](https://github.com/mumu-lhl/dict_reader/issues/1)) - ([d56d190](https://github.com/mumu-lhl/dict_reader/commit/d56d190e9732eff3939c63a83201ec068f2327ca)) - dependabot[bot]
+- **(workflow)** create dependabot.yml - ([6b811d3](https://github.com/mumu-lhl/dict_reader/commit/6b811d38f37f9e8fbc6e77799e9e9b4be0de3d6d)) - Mumulhl
+
+---
 ## [1.1.2](https://github.com/mumu-lhl/dict_reader/compare/v1.1.1..v1.1.2) - 2024-09-07
 
 ### Miscellaneous Chores
