@@ -460,7 +460,7 @@ class DictReader {
       if (_encoding == "UTF-16" && _mdx) {
         keyText = Utf16Decoder().decodeUtf16Le(keyEncoded);
       } else {
-        keyText = utf8.decode(keyEncoded, allowMalformed: true);
+        keyText = utf8.decode(keyEncoded);
       }
 
       if (!_mdx) {
