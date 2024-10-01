@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [1.1.4](https://github.com/mumu-lhl/dict_reader/compare/v1.1.3..v1.1.4) - 2024-10-01
+
+### Bug Fixes
+
+- replace invaild characters for utf8 decode - ([690255b](https://github.com/mumu-lhl/dict_reader/commit/690255bd946d198574223d242984f6d4a99e30df)) - Mumulhl
+- fix keyText in mdd - ([912563f](https://github.com/mumu-lhl/dict_reader/commit/912563ff086c7ff20c03710ea742d4451c4d177a)) - Mumulhl
+
+### Revert
+
+- fix: replace invaild characters for utf8 decode - ([e5aecd2](https://github.com/mumu-lhl/dict_reader/commit/e5aecd241b9681fd7845c138121743b4c837355b)) - Mumulhl
+
+---
 ## [1.1.3](https://github.com/mumu-lhl/dict_reader/compare/v1.1.2..v1.1.3) - 2024-10-01
 
 ### Bug Fixes
