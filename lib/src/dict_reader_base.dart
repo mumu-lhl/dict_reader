@@ -458,7 +458,7 @@ class DictReader {
       String keyText;
 
       if (_encoding == "UTF-16" && _mdx) {
-        keyText = utf16.decode(keyEncoded);
+        keyText = Utf16Decoder().decodeUtf16Le(keyEncoded);
       } else {
         keyText = utf8.decode(keyEncoded);
       }
@@ -495,9 +495,9 @@ class DictReader {
     for (var i = 0; i < txtList.length - 1; i++) {
       final p = txtList.sublist(1)[i];
       final txtTag = txtTags[i];
-      final style = _stylesheet[txtTag.substring(1, txtTag.length)];
+      final style = _stylesheet[txtTag.substring(1, txtTag.length - 1)];
 
-      if (p != "" && p[p.length] == "\n") {
+      if (p != "" && p[p.length - 1] == "\n") {
         txtStyled = "$txtStyled${style!.$1}${p.trimRight()}${style.$1}\r\n";
       } else {
         txtStyled = "$txtStyled${style!.$1}$p${style.$1}";
@@ -512,7 +512,7 @@ class DictReader {
 
     if (_mdx) {
       if (_encoding == "UTF-16") {
-        dataReturned = utf16.decode(data);
+        dataReturned = Utf16Decoder().decodeUtf16Le(data);
       } else {
         dataReturned = utf8.decode(data);
       }
