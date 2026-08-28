@@ -8,6 +8,8 @@ import "package:charset/charset.dart";
 import "package:collection/collection.dart";
 import "package:html_unescape/html_unescape.dart";
 
+const _cacheVersion = 2;
+
 Uint8List _fastDecrypt(Uint8List data, Uint8List key) {
   // XOR decryption
   final b = data;
@@ -36,9 +38,9 @@ int _readByte(Uint8List buffer, int byteWidth, [int start = 0]) {
 int _readNumber(Uint8List buffer, int numberWidth, [int start = 0]) {
   final byteBuffer = ByteData.view(buffer.buffer);
   if (numberWidth == 4) {
-    return byteBuffer.getInt32(start, Endian.big);
+    return byteBuffer.getUint32(start, Endian.big);
   } else {
-    return byteBuffer.getInt64(start, Endian.big);
+    return byteBuffer.getUint64(start, Endian.big);
   }
 }
 
@@ -160,14 +162,25 @@ class DictReader {
   /// This method extracts the key list, number of entries, record block offset,
   /// record block info list, and total decompressed size into a map, which can
   /// be used for caching. This operation is performed in an isolate.
-  Future<Map<String, dynamic>> exportCache() {
+  Future<Map<String, dynamic>> exportCache() async {
+    final file = File(_path);
+    final stat = await file.stat();
+    final filePath = await file.resolveSymbolicLinks();
     final keyList = _keyList;
     final numEntries = this.numEntries;
     final recordBlockOffset = _recordBlockOffset;
     final recordBlockInfoList = _recordBlockInfoList;
     final totalDecompressedSize = _totalDecompressedSize;
-    return Isolate.run(() => _exportCacheIsolate(keyList, numEntries,
-        recordBlockOffset, recordBlockInfoList, totalDecompressedSize));
+    return Isolate.run(() => _exportCacheIsolate(
+          keyList,
+          numEntries,
+          recordBlockOffset,
+          recordBlockInfoList,
+          totalDecompressedSize,
+          filePath,
+          stat.size,
+          stat.modified.microsecondsSinceEpoch,
+        ));
   }
 
   /// Exports the cache data as a JSON string.
@@ -184,7 +197,32 @@ class DictReader {
   /// This method populates the dictionary's fields from a cache map, avoiding
   /// the need to re-read and process the dictionary file. This operation is
   /// performed in an isolate.
+  Future<void> _validateCache(Map<String, dynamic> cacheData) async {
+    if (cacheData['cacheVersion'] != _cacheVersion) {
+      throw const FormatException("Unsupported dictionary cache version");
+    }
+
+    final cachedPath = cacheData['filePath'];
+    if (cachedPath is! String) {
+      throw const FormatException("Dictionary cache has no file identity");
+    }
+
+    final file = File(_path);
+    final actualPath = await file.resolveSymbolicLinks();
+    if (cachedPath != actualPath) {
+      throw const FormatException("Dictionary cache belongs to another file");
+    }
+
+    final stat = await file.stat();
+    if (cacheData['fileSize'] != stat.size ||
+        cacheData['fileModified'] != stat.modified.microsecondsSinceEpoch) {
+      throw const FormatException(
+          "Dictionary file has changed since cache export");
+    }
+  }
+
   Future<void> importCache(Map<String, dynamic> cacheData) async {
+    await _validateCache(cacheData);
     if (_f == null) {
       _dict = File(_path);
       _f = await _dict!.open();
@@ -250,75 +288,20 @@ class DictReader {
       return;
     }
 
-    final f = _f!;
-    await f.setPosition(_recordBlockOffset);
-
-    final numRecordBlocks = await _readNumberer(f);
-    // number of entries
-    await _readNumberer(f);
-
-    // size of record block info
-    await _readNumberer(f);
-    // size of record block
-    await _readNumberer(f);
-
-    // record block info section
-    final List<int> recordBlockLnfoList = [];
-
-    for (var i = 0; i < numRecordBlocks; i++) {
-      final compressedSize = await _readNumberer(f);
-      // record block decompressed size
-      await _readNumberer(f);
-
-      recordBlockLnfoList.add(compressedSize);
-    }
-
-    // actual record block
-    var offset = 0;
-    var i = 0;
-    var recordBlockOffset = await f.position();
-
-    for (final compressedSize in recordBlockLnfoList) {
-      final recordBlock = _decodeBlock(await f.read(compressedSize));
-
-      // split record block according to the offset info from key block
-      while (i < _keyList.length) {
-        final (recordStart, keyText) = _keyList[i];
-
-        // reach the end of current record block
-        if (recordStart - offset >= recordBlock.length) {
-          break;
-        }
-
-        // record end index
-        int recordEnd;
-
-        if (i < _keyList.length - 1) {
-          recordEnd = _keyList[i + 1].$1;
-        } else {
-          recordEnd = recordBlock.length + offset;
-        }
-
-        i += 1;
-
-        if (returnData) {
-          final originalData =
-              recordBlock.sublist(recordStart - offset, recordEnd - offset);
-          final data = _mdx ? _treatRecordMdxData(originalData) : originalData;
-
-          yield (keyText, data);
-        } else {
-          final startOffset = recordStart - offset;
-          final endOffset = recordEnd - offset;
-          yield (
-            keyText,
-            (recordBlockOffset, startOffset, endOffset, compressedSize)
-          );
-        }
+    await for (final offsetInfo in readWithOffset()) {
+      if (offsetInfo.segments.length > 1) {
+        throw UnsupportedError(
+            "Use readWithOffset for records spanning multiple blocks");
       }
-
-      offset += recordBlock.length;
-      recordBlockOffset += compressedSize;
+      yield (
+        offsetInfo.keyText,
+        (
+          offsetInfo.recordBlockOffset,
+          offsetInfo.startOffset,
+          offsetInfo.endOffset,
+          offsetInfo.compressedSize,
+        )
+      );
     }
   }
 
@@ -330,43 +313,58 @@ class DictReader {
   @Deprecated("Use readOneMdx or readOneMdd instead.")
   dynamic readOne(
       int offset, int startOffset, int endOffset, int compressedSize) async {
-    final f = _f!;
-    await f.setPosition(offset);
+    final f = await _openReadHandle();
+    try {
+      await f.setPosition(offset);
 
-    final recordBlock = _decodeBlock(await f.read(compressedSize));
-    final originalData = recordBlock.sublist(startOffset, endOffset);
-    final data = _mdx ? _treatRecordMdxData(originalData) : originalData;
+      final recordBlock = _decodeBlock(await f.read(compressedSize));
+      final originalData = recordBlock.sublist(startOffset, endOffset);
+      final data = _mdx ? _treatRecordMdxData(originalData) : originalData;
 
-    return data;
+      return data;
+    } finally {
+      await f.close();
+    }
+  }
+
+  Future<RandomAccessFile> _openReadHandle() async {
+    if (_f == null) {
+      throw StateError("Dictionary is not initialized");
+    }
+    return File(_path).open();
   }
 
   Future<List<int>> _readRecordData(RecordOffsetInfo recordOffsetInfo) async {
-    final f = _f!;
-    final segments = recordOffsetInfo.segments.isEmpty
-        ? <(int, int, int, int)>[
-            (
-              recordOffsetInfo.recordBlockOffset,
-              recordOffsetInfo.startOffset,
-              recordOffsetInfo.endOffset,
-              recordOffsetInfo.compressedSize,
-            )
-          ]
-        : recordOffsetInfo.segments;
-    final data = BytesBuilder();
+    final f = await _openReadHandle();
+    try {
+      final segments = recordOffsetInfo.segments.isEmpty
+          ? <(int, int, int, int)>[
+              (
+                recordOffsetInfo.recordBlockOffset,
+                recordOffsetInfo.startOffset,
+                recordOffsetInfo.endOffset,
+                recordOffsetInfo.compressedSize,
+              )
+            ]
+          : recordOffsetInfo.segments;
+      final data = BytesBuilder();
 
-    for (final segment in segments) {
-      if (segment.$2 < 0 || segment.$3 < segment.$2) {
-        throw FormatException("Invalid record offset");
+      for (final segment in segments) {
+        if (segment.$2 < 0 || segment.$3 < segment.$2) {
+          throw FormatException("Invalid record offset");
+        }
+        await f.setPosition(segment.$1);
+        final recordBlock = _decodeBlock(await f.read(segment.$4));
+        if (segment.$3 > recordBlock.length) {
+          throw FormatException("Record offset exceeds record block");
+        }
+        data.add(recordBlock.sublist(segment.$2, segment.$3));
       }
-      await f.setPosition(segment.$1);
-      final recordBlock = _decodeBlock(await f.read(segment.$4));
-      if (segment.$3 > recordBlock.length) {
-        throw FormatException("Record offset exceeds record block");
-      }
-      data.add(recordBlock.sublist(segment.$2, segment.$3));
+
+      return data.toBytes();
+    } finally {
+      await f.close();
     }
-
-    return data.toBytes();
   }
 
   /// Only reads a mdd file's one record.
@@ -930,9 +928,9 @@ class DictReader {
     final bytes = await file.read(numberWidth);
 
     if (numberWidth == 4) {
-      return ByteData.sublistView(bytes).getInt32(0);
+      return ByteData.sublistView(bytes).getUint32(0);
     } else {
-      return ByteData.sublistView(bytes).getInt64(0);
+      return ByteData.sublistView(bytes).getUint64(0);
     }
   }
 
@@ -983,7 +981,19 @@ class DictReader {
       T Function(String keyText, List<int> originalData,
               List<(int, int, int, int)> segments)
           recordProcessor) async* {
-    final f = _f!;
+    final f = await _openReadHandle();
+    try {
+      yield* _readRecordsFromHandle(f, recordProcessor);
+    } finally {
+      await f.close();
+    }
+  }
+
+  Stream<T> _readRecordsFromHandle<T>(
+      RandomAccessFile f,
+      T Function(String keyText, List<int> originalData,
+              List<(int, int, int, int)> segments)
+          recordProcessor) async* {
     await f.setPosition(_recordBlockOffset);
 
     final numRecordBlocks = await _readNumberer(f);
@@ -1275,8 +1285,15 @@ Map<String, dynamic> _exportCacheIsolate(
     int numEntries,
     int recordBlockOffset,
     List<(int, int)>? recordBlockInfoList,
-    int? totalDecompressedSize) {
+    int? totalDecompressedSize,
+    String filePath,
+    int fileSize,
+    int fileModified) {
   return {
+    'cacheVersion': _cacheVersion,
+    'filePath': filePath,
+    'fileSize': fileSize,
+    'fileModified': fileModified,
     'keyList': keyList.map((e) => [e.$1, e.$2]).toList(),
     'numEntries': numEntries,
     'recordBlockOffset': recordBlockOffset,

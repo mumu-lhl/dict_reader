@@ -302,6 +302,36 @@ void main() {
     expect((await reader.readWithMdxData().toList()).length, 2);
   });
 
+  test('does not let a nested read disturb record iteration', () async {
+    final directory =
+        await Directory.systemTemp.createTemp('dict_reader_concurrency_test_');
+    addTearDown(() => directory.delete(recursive: true));
+    final file = await _createFixture(
+      directory,
+      entries: [('alpha', 'A'), (r'$beta', 'B'), ('gamma', 'C')],
+      recordBlockPayloads: [
+        utf8.encode('A'),
+        utf8.encode('B'),
+        utf8.encode('C'),
+      ],
+    );
+
+    final reader = DictReader(file.path);
+    await reader.initDict();
+    addTearDown(reader.close);
+
+    final keys = <String>[];
+    await for (final offset in reader.readWithOffset()) {
+      keys.add(offset.keyText);
+      if (offset.keyText == 'alpha') {
+        final gamma = await reader.locate('gamma');
+        expect(await reader.readOneMdx(gamma!), 'C');
+      }
+    }
+
+    expect(keys, ['alpha', r'$beta', 'gamma']);
+  });
+
   test('imports cache into a fresh reader', () async {
     final directory =
         await Directory.systemTemp.createTemp('dict_reader_cache_test_');
@@ -320,5 +350,45 @@ void main() {
     final offset = await reader.locate('alpha');
     expect(offset, isNotNull);
     expect(await reader.readOneMdx(offset!), 'A');
+  });
+
+  test('rejects cache with an unsupported version', () async {
+    final directory = await Directory.systemTemp
+        .createTemp('dict_reader_cache_version_test_');
+    addTearDown(() => directory.delete(recursive: true));
+    final file = await _createFixture(directory);
+
+    final source = DictReader(file.path);
+    await source.initDict();
+    final cache = await source.exportCache();
+    await source.close();
+    cache['cacheVersion'] = 999;
+
+    final reader = DictReader(file.path);
+    addTearDown(reader.close);
+    await expectLater(
+      () async => reader.importCache(cache),
+      throwsA(isA<FormatException>()),
+    );
+  });
+
+  test('rejects cache for a different dictionary file', () async {
+    final directory = await Directory.systemTemp
+        .createTemp('dict_reader_cache_identity_test_');
+    addTearDown(() => directory.delete(recursive: true));
+    final file = await _createFixture(directory);
+
+    final source = DictReader(file.path);
+    await source.initDict();
+    final cache = await source.exportCache();
+    await source.close();
+    cache['fileSize'] = 0;
+
+    final reader = DictReader(file.path);
+    addTearDown(reader.close);
+    await expectLater(
+      () async => reader.importCache(cache),
+      throwsA(isA<FormatException>()),
+    );
   });
 }
