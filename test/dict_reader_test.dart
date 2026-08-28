@@ -130,6 +130,34 @@ void main() {
     expect(await reader.readOneMdx(offset!), 'B');
   });
 
+  test('uses a sorted index for search and duplicate keys', () async {
+    final directory =
+        await Directory.systemTemp.createTemp('dict_reader_search_test_');
+    addTearDown(() => directory.delete(recursive: true));
+    final file = await _createFixture(
+      directory,
+      entries: [
+        ('beta', 'first'),
+        ('alpha', 'A'),
+        ('beta', 'second'),
+        ('betamax', 'C'),
+      ],
+    );
+
+    final reader = DictReader(file.path);
+    await reader.initDict();
+    addTearDown(reader.close);
+
+    expect(reader.search('be'), ['beta', 'beta', 'betamax']);
+    expect(reader.search('be', limit: 2), ['beta', 'beta']);
+    expect(reader.exist('beta'), isTrue);
+    expect(reader.exist('missing'), isFalse);
+
+    final offsets = await reader.locateAll('beta');
+    expect(
+        await Future.wait(offsets.map(reader.readOneMdx)), ['first', 'second']);
+  });
+
   test('handles records crossing record block boundaries', () async {
     final directory =
         await Directory.systemTemp.createTemp('dict_reader_boundary_test_');

@@ -5,10 +5,10 @@ import "dart:typed_data";
 
 import "package:blockchain_utils/crypto/crypto/hash/hash.dart";
 import "package:charset/charset.dart";
-import "package:collection/collection.dart";
 import "package:html_unescape/html_unescape.dart";
 
 const _cacheVersion = 2;
+const _utf16Decoder = Utf16Decoder();
 
 Uint8List _fastDecrypt(Uint8List data, Uint8List key) {
   // XOR decryption
@@ -26,22 +26,43 @@ Uint8List _fastDecrypt(Uint8List data, Uint8List key) {
   return b;
 }
 
-int _readByte(Uint8List buffer, int byteWidth, [int start = 0]) {
-  final byteBuffer = ByteData.view(buffer.buffer);
+int _readByte(List<int> buffer, int byteWidth, [int start = 0]) {
   if (byteWidth == 1) {
-    return byteBuffer.getUint8(start);
-  } else {
-    return byteBuffer.getUint16(start);
+    return buffer[start];
   }
+  return (buffer[start] << 8) | buffer[start + 1];
 }
 
-int _readNumber(Uint8List buffer, int numberWidth, [int start = 0]) {
-  final byteBuffer = ByteData.view(buffer.buffer);
-  if (numberWidth == 4) {
-    return byteBuffer.getUint32(start, Endian.big);
-  } else {
-    return byteBuffer.getUint64(start, Endian.big);
+int _readNumber(List<int> buffer, int numberWidth, [int start = 0]) {
+  var value = 0;
+  for (var i = 0; i < numberWidth; i++) {
+    value = (value << 8) | buffer[start + i];
   }
+  return value;
+}
+
+List<int> _sliceBytes(List<int> data, int start, int end) {
+  if (data is Uint8List) {
+    return Uint8List.sublistView(data, start, end);
+  }
+  return data.sublist(start, end);
+}
+
+int _findByteTerminator(Uint8List bytes, int start) {
+  var index = start;
+  while (index < bytes.length && bytes[index] != 0) {
+    index++;
+  }
+  return index;
+}
+
+int _findUtf16Terminator(Uint8List bytes, int start) {
+  var index = start;
+  while (index + 1 < bytes.length &&
+      (bytes[index] != 0 || bytes[index + 1] != 0)) {
+    index += 2;
+  }
+  return index;
 }
 
 /// Reading MDX/MDD files.
@@ -56,14 +77,22 @@ class DictReader {
   late bool _mdx;
   late double _version;
   late String _encoding;
+  late String _normalizedEncoding;
+  Encoding? _textCodec;
   bool _headerLoaded = false;
   File? _dict;
   late List<(int, String)> _keyList;
-  late List<(int, String, int)> _lookupKeyList;
+  late List<int> _lookupKeyIndices;
   late int _encrypt;
   RandomAccessFile? _f;
   List<(int, int)>? _recordBlockInfoList;
   int? _totalDecompressedSize;
+  List<int>? _recordBlockDecompressedStarts;
+  List<int>? _recordBlockFileOffsets;
+  final Map<(int, int), List<int>> _recordBlockCache = {};
+  int _recordBlockCacheSize = 0;
+
+  static const _maxRecordBlockCacheSize = 32 * 1024 * 1024;
 
   late Map<String, String> header;
 
@@ -138,6 +167,7 @@ class DictReader {
       if (readRecordBlockInfo) {
         _recordBlockInfoList = initData.recordBlockInfoList;
         _totalDecompressedSize = initData.totalDecompressedSize;
+        _buildRecordBlockIndex();
 
         if (_onRecordBlockInfoRead != null) {
           _onRecordBlockInfoRead!();
@@ -155,6 +185,10 @@ class DictReader {
     _headerLoaded = false;
     _recordBlockInfoList = null;
     _totalDecompressedSize = null;
+    _recordBlockDecompressedStarts = null;
+    _recordBlockFileOffsets = null;
+    _recordBlockCache.clear();
+    _recordBlockCacheSize = 0;
   }
 
   /// Exports the cache data as a map.
@@ -241,6 +275,7 @@ class DictReader {
     _recordBlockInfoList =
         importedData['recordBlockInfoList'] as List<(int, int)>?;
     _totalDecompressedSize = importedData['totalDecompressedSize'];
+    _buildRecordBlockIndex();
   }
 
   /// Imports cache data from a JSON string.
@@ -313,18 +348,11 @@ class DictReader {
   @Deprecated("Use readOneMdx or readOneMdd instead.")
   dynamic readOne(
       int offset, int startOffset, int endOffset, int compressedSize) async {
-    final f = await _openReadHandle();
-    try {
-      await f.setPosition(offset);
+    final recordBlock = await _readRecordBlockAt(offset, compressedSize);
+    final originalData = recordBlock.sublist(startOffset, endOffset);
+    final data = _mdx ? _treatRecordMdxData(originalData) : originalData;
 
-      final recordBlock = _decodeBlock(await f.read(compressedSize));
-      final originalData = recordBlock.sublist(startOffset, endOffset);
-      final data = _mdx ? _treatRecordMdxData(originalData) : originalData;
-
-      return data;
-    } finally {
-      await f.close();
-    }
+    return data;
   }
 
   Future<RandomAccessFile> _openReadHandle() async {
@@ -334,8 +362,67 @@ class DictReader {
     return File(_path).open();
   }
 
-  Future<List<int>> _readRecordData(RecordOffsetInfo recordOffsetInfo) async {
+  List<int>? _takeCachedRecordBlock(int offset, int compressedSize) {
+    final cacheKey = (offset, compressedSize);
+    final cached = _recordBlockCache.remove(cacheKey);
+    if (cached != null) {
+      // Map preserves insertion order, so removing and re-inserting gives us
+      // a small LRU cache without another dependency.
+      _recordBlockCache[cacheKey] = cached;
+    }
+    return cached;
+  }
+
+  void _cacheRecordBlock(int offset, int compressedSize, List<int> block) {
+    final cacheKey = (offset, compressedSize);
+    final previous = _recordBlockCache.remove(cacheKey);
+    if (previous != null) {
+      _recordBlockCacheSize -= previous.length;
+    }
+    if (block.length > _maxRecordBlockCacheSize) {
+      return;
+    }
+
+    _recordBlockCache[cacheKey] = block;
+    _recordBlockCacheSize += block.length;
+    while (_recordBlockCacheSize > _maxRecordBlockCacheSize &&
+        _recordBlockCache.isNotEmpty) {
+      final oldestKey = _recordBlockCache.keys.first;
+      final oldest = _recordBlockCache.remove(oldestKey)!;
+      _recordBlockCacheSize -= oldest.length;
+    }
+  }
+
+  Future<List<int>> _readRecordBlockFromHandle(
+      RandomAccessFile f, int offset, int compressedSize) async {
+    await f.setPosition(offset);
+    final block = _decodeBlock(await f.read(compressedSize));
+    _cacheRecordBlock(offset, compressedSize, block);
+    return block;
+  }
+
+  Future<List<int>> _readRecordBlockAt(int offset, int compressedSize) async {
+    if (_f == null) {
+      throw StateError("Dictionary is not initialized");
+    }
+    final cached = _takeCachedRecordBlock(offset, compressedSize);
+    if (cached != null) {
+      return cached;
+    }
+
     final f = await _openReadHandle();
+    try {
+      return await _readRecordBlockFromHandle(f, offset, compressedSize);
+    } finally {
+      await f.close();
+    }
+  }
+
+  Future<List<int>> _readRecordData(RecordOffsetInfo recordOffsetInfo) async {
+    if (_f == null) {
+      throw StateError("Dictionary is not initialized");
+    }
+    RandomAccessFile? f;
     try {
       final segments = recordOffsetInfo.segments.isEmpty
           ? <(int, int, int, int)>[
@@ -347,23 +434,35 @@ class DictReader {
               )
             ]
           : recordOffsetInfo.segments;
-      final data = BytesBuilder();
-
+      var dataLength = 0;
       for (final segment in segments) {
         if (segment.$2 < 0 || segment.$3 < segment.$2) {
           throw FormatException("Invalid record offset");
         }
-        await f.setPosition(segment.$1);
-        final recordBlock = _decodeBlock(await f.read(segment.$4));
+        dataLength += segment.$3 - segment.$2;
+      }
+      final data = Uint8List(dataLength);
+      var dataOffset = 0;
+
+      for (final segment in segments) {
+        var recordBlock = _takeCachedRecordBlock(segment.$1, segment.$4);
+        if (recordBlock == null) {
+          f ??= await _openReadHandle();
+          recordBlock =
+              await _readRecordBlockFromHandle(f, segment.$1, segment.$4);
+        }
         if (segment.$3 > recordBlock.length) {
           throw FormatException("Record offset exceeds record block");
         }
-        data.add(recordBlock.sublist(segment.$2, segment.$3));
+        final segmentLength = segment.$3 - segment.$2;
+        data.setRange(
+            dataOffset, dataOffset + segmentLength, recordBlock, segment.$2);
+        dataOffset += segmentLength;
       }
 
-      return data.toBytes();
+      return data;
     } finally {
-      await f.close();
+      await f?.close();
     }
   }
 
@@ -420,7 +519,7 @@ class DictReader {
         firstSegment.$4,
         segments: segments,
       );
-    });
+    }, readData: false);
   }
 
   /// Locates the position information of a key (word).
@@ -428,14 +527,13 @@ class DictReader {
   /// This method can be used to get the content of a key after initialization.
   /// Returns `null` if the key is not found.
   Future<RecordOffsetInfo?> locate(String key) async {
-    final keyIndex = binarySearch(_lookupKeyList, (0, key, 0),
-        compare: (a, b) => a.$2.compareTo(b.$2));
+    final keyIndex = _lookupBinarySearch(key);
 
     if (keyIndex < 0) {
       return null;
     }
 
-    final physicalIndex = _lookupKeyList[keyIndex].$3;
+    final physicalIndex = _lookupKeyIndices[keyIndex];
     final recordStart = _keyList[physicalIndex].$1;
     final recordEnd = (physicalIndex < _keyList.length - 1)
         ? _keyList[physicalIndex + 1].$1
@@ -450,17 +548,16 @@ class DictReader {
   Future<List<RecordOffsetInfo>> locateAll(String key) async {
     final results = <RecordOffsetInfo>[];
     // Use lowerBound to find the first potential match.
-    var keyIndex = lowerBound(_lookupKeyList, (0, key, 0),
-        compare: (a, b) => a.$2.compareTo(b.$2));
+    var keyIndex = _lookupLowerBound(key);
 
-    if (keyIndex == _lookupKeyList.length ||
-        _lookupKeyList[keyIndex].$2 != key) {
+    if (keyIndex == _lookupKeyIndices.length ||
+        _keyList[_lookupKeyIndices[keyIndex]].$2 != key) {
       return [];
     }
 
-    while (keyIndex < _lookupKeyList.length &&
-        _lookupKeyList[keyIndex].$2 == key) {
-      final physicalIndex = _lookupKeyList[keyIndex].$3;
+    while (keyIndex < _lookupKeyIndices.length &&
+        _keyList[_lookupKeyIndices[keyIndex]].$2 == key) {
+      final physicalIndex = _lookupKeyIndices[keyIndex];
       final recordStart = _keyList[physicalIndex].$1;
       final recordEnd = (physicalIndex < _keyList.length - 1)
           ? _keyList[physicalIndex + 1].$1
@@ -481,30 +578,84 @@ class DictReader {
   /// Returns an empty list if the key is not found.
   List<String> search(String key, {int? limit}) {
     // Use lowerBound to find the first potential match.
-    final firstMatchIndex = lowerBound(_lookupKeyList, (0, key, 0),
-        compare: (a, b) => a.$2.compareTo(b.$2));
+    final firstMatchIndex = _lookupLowerBound(key);
 
-    return _collectMatches(_lookupKeyList, key, firstMatchIndex, limit);
+    return _collectMatches(_lookupKeyIndices, key, firstMatchIndex, limit);
   }
 
   /// Checks if a key (word) exists in the dictionary.
   ///
   /// Returns `true` if the key is found, otherwise `false`.
   bool exist(String key) {
-    final keyIndex = binarySearch(_lookupKeyList, (0, key, 0),
-        compare: (a, b) => a.$2.compareTo(b.$2));
-    return keyIndex >= 0;
+    return _lookupBinarySearch(key) >= 0;
+  }
+
+  int _lookupBinarySearch(String key) {
+    var min = 0;
+    var max = _lookupKeyIndices.length;
+    while (min < max) {
+      final middle = min + ((max - min) >> 1);
+      final comparison = _keyList[_lookupKeyIndices[middle]].$2.compareTo(key);
+      if (comparison == 0) {
+        return middle;
+      }
+      if (comparison < 0) {
+        min = middle + 1;
+      } else {
+        max = middle;
+      }
+    }
+    return -1;
+  }
+
+  int _lookupLowerBound(String key) {
+    var min = 0;
+    var max = _lookupKeyIndices.length;
+    while (min < max) {
+      final middle = min + ((max - min) >> 1);
+      final comparison = _keyList[_lookupKeyIndices[middle]].$2.compareTo(key);
+      if (comparison < 0) {
+        min = middle + 1;
+      } else {
+        max = middle;
+      }
+    }
+    return min;
   }
 
   void _rebuildLookupKeyList() {
-    _lookupKeyList = [
-      for (var i = 0; i < _keyList.length; i++)
-        (_keyList[i].$1, _keyList[i].$2, i),
-    ];
-    mergeSort(_lookupKeyList, compare: (a, b) {
-      final keyComparison = a.$2.compareTo(b.$2);
-      return keyComparison != 0 ? keyComparison : a.$3.compareTo(b.$3);
+    final lookupKeyIndices =
+        List<int>.generate(_keyList.length, (index) => index);
+    lookupKeyIndices.sort((a, b) {
+      final keyComparison = _keyList[a].$2.compareTo(_keyList[b].$2);
+      return keyComparison != 0 ? keyComparison : a.compareTo(b);
     });
+    _lookupKeyIndices = lookupKeyIndices;
+  }
+
+  void _buildRecordBlockIndex() {
+    final blockInfoList = _recordBlockInfoList;
+    if (blockInfoList == null) {
+      _recordBlockDecompressedStarts = null;
+      _recordBlockFileOffsets = null;
+      return;
+    }
+
+    final decompressedStarts = List<int>.filled(blockInfoList.length, 0);
+    final fileOffsets = List<int>.filled(blockInfoList.length, 0);
+    var decompressedOffset = 0;
+    var fileOffset = _recordBlockOffset + _numberWidth * 4;
+    fileOffset += blockInfoList.length * _numberWidth * 2;
+
+    for (var i = 0; i < blockInfoList.length; i++) {
+      decompressedStarts[i] = decompressedOffset;
+      fileOffsets[i] = fileOffset;
+      decompressedOffset += blockInfoList[i].$2;
+      fileOffset += blockInfoList[i].$1;
+    }
+
+    _recordBlockDecompressedStarts = decompressedStarts;
+    _recordBlockFileOffsets = fileOffsets;
   }
 
   RecordOffsetInfo? _buildRecordOffsetInfo(
@@ -520,15 +671,34 @@ class DictReader {
       return null;
     }
 
-    final segments = <(int, int, int, int)>[];
-    var accumulatedDecompressedSize = 0;
-    var recordBlockFileOffset = _recordBlockOffset + _numberWidth * 4;
-    recordBlockFileOffset += blockInfoList.length * _numberWidth * 2;
+    if (_recordBlockDecompressedStarts == null ||
+        _recordBlockFileOffsets == null) {
+      _buildRecordBlockIndex();
+    }
+    final decompressedStarts = _recordBlockDecompressedStarts!;
+    final fileOffsets = _recordBlockFileOffsets!;
 
-    for (final blockInfo in blockInfoList) {
-      final compressedSize = blockInfo.$1;
-      final decompressedSize = blockInfo.$2;
-      final blockStart = accumulatedDecompressedSize;
+    // Find the first block whose end is after recordStart. This changes the
+    // common locate path from a full metadata scan to a binary search.
+    var low = 0;
+    var high = blockInfoList.length;
+    while (low < high) {
+      final middle = (low + high) >> 1;
+      final blockEnd = decompressedStarts[middle] + blockInfoList[middle].$2;
+      if (blockEnd <= recordStart) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+
+    final segments = <(int, int, int, int)>[];
+    for (var blockIndex = low;
+        blockIndex < blockInfoList.length;
+        blockIndex++) {
+      final compressedSize = blockInfoList[blockIndex].$1;
+      final decompressedSize = blockInfoList[blockIndex].$2;
+      final blockStart = decompressedStarts[blockIndex];
       final blockEnd = blockStart + decompressedSize;
 
       if (recordStart < blockEnd && actualRecordEnd > blockStart) {
@@ -538,13 +708,17 @@ class DictReader {
             ? actualRecordEnd - blockStart
             : decompressedSize;
         if (endOffset >= startOffset) {
-          segments.add(
-              (recordBlockFileOffset, startOffset, endOffset, compressedSize));
+          segments.add((
+            fileOffsets[blockIndex],
+            startOffset,
+            endOffset,
+            compressedSize
+          ));
         }
       }
-
-      accumulatedDecompressedSize = blockEnd;
-      recordBlockFileOffset += compressedSize;
+      if (actualRecordEnd <= blockEnd) {
+        break;
+      }
     }
 
     if (segments.isEmpty) {
@@ -564,13 +738,13 @@ class DictReader {
 
   /// Collects all matching keys starting from a given index.
   List<String> _collectMatches(
-      List<(int, String, int)> list, String key, int startIndex, int? limit) {
+      List<int> list, String key, int startIndex, int? limit) {
     final matchedKeys = <String>[];
     for (var i = startIndex; i < list.length; i++) {
       if (limit != null && matchedKeys.length >= limit) {
         break;
       }
-      final currentKey = list[i].$2;
+      final currentKey = _keyList[list[i]].$2;
       if (currentKey.startsWith(key)) {
         matchedKeys.add(currentKey);
       } else {
@@ -581,14 +755,36 @@ class DictReader {
     return matchedKeys;
   }
 
+  void _configureEncoding() {
+    _normalizedEncoding = _encoding.toUpperCase();
+    if (_normalizedEncoding == "UTF-16" ||
+        _normalizedEncoding == "UTF-16LE" ||
+        _normalizedEncoding == "UTF-16BE" ||
+        _normalizedEncoding == "UTF-8" ||
+        _normalizedEncoding == "UTF8") {
+      _textCodec = null;
+    } else {
+      _textCodec = Charset.getByName(_encoding);
+    }
+  }
+
   bool get _isUtf16 {
-    final encoding = _encoding.toUpperCase();
+    final encoding = _normalizedEncoding;
     return encoding == "UTF-16" ||
         encoding == "UTF-16LE" ||
         encoding == "UTF-16BE";
   }
 
   String _decodeUtf8IgnoringMalformed(List<int> data) {
+    // Let the VM's decoder handle the overwhelmingly common valid case. The
+    // custom path below is retained because this package intentionally skips
+    // malformed bytes instead of emitting U+FFFD.
+    try {
+      return utf8.decode(data);
+    } on FormatException {
+      // Fall through to the compatibility decoder.
+    }
+
     final codePoints = <int>[];
     var i = 0;
 
@@ -644,18 +840,18 @@ class DictReader {
   }
 
   String _decodeText(List<int> data) {
-    final encoding = _encoding.toUpperCase();
+    final encoding = _normalizedEncoding;
     if (encoding == "UTF-16BE") {
-      return Utf16Decoder().decodeUtf16Be(data);
+      return _utf16Decoder.decodeUtf16Be(data);
     }
     if (encoding == "UTF-16" || encoding == "UTF-16LE") {
-      return Utf16Decoder().decodeUtf16Le(data);
+      return _utf16Decoder.decodeUtf16Le(data);
     }
     if (encoding == "UTF-8" || encoding == "UTF8") {
       return _decodeUtf8IgnoringMalformed(data);
     }
 
-    final codec = Charset.getByName(_encoding);
+    final codec = _textCodec;
     if (codec == null) {
       throw FormatException("Unsupported dictionary encoding: $_encoding");
     }
@@ -681,23 +877,18 @@ class DictReader {
   }
 
   List<int> _decodeBlock(List<int> block) {
-    final byteBuffer =
-        ByteData.view(Uint8List.fromList(block).sublist(0, 4).buffer);
-    final info = byteBuffer.getUint32(0, Endian.little);
-    final compressionMethod = info & 0xf;
-    final data = block.sublist(8);
-
-    List<int> decompressedBlock;
+    // The compression method is stored in the low nibble of the first
+    // little-endian word, so reading the first byte is sufficient.
+    final compressionMethod = block[0] & 0xf;
+    final data = _sliceBytes(block, 8, block.length);
 
     if (compressionMethod == 0) {
-      decompressedBlock = data;
-    } else if (compressionMethod == 2) {
-      decompressedBlock = zlib.decode(data);
-    } else {
-      throw "Compression method not supported";
+      return data;
     }
-
-    return decompressedBlock;
+    if (compressionMethod == 2) {
+      return zlib.decode(data);
+    }
+    throw "Compression method not supported";
   }
 
   List<(int, String)> _decodeKeyBlock(
@@ -707,7 +898,7 @@ class DictReader {
 
     for (final compressedSize in keyBlockInfoList) {
       final keyBlock =
-          _decodeBlock(keyBlockCompressed.sublist(i, i + compressedSize));
+          _decodeBlock(_sliceBytes(keyBlockCompressed, i, i + compressedSize));
       keyList.addAll(_splitKeyBlock(keyBlock));
       i += compressedSize;
     }
@@ -722,12 +913,15 @@ class DictReader {
       if ((_encrypt & 0x02) != 0) {
         final key = RIPEMD128
             .hash(keyBlockInfoCompressed.sublist(4, 8) + [149, 54, 0, 0]);
-        keyBlockInfoCompressed = keyBlockInfoCompressed.sublist(0, 8) +
-            _fastDecrypt(Uint8List.fromList(keyBlockInfoCompressed.sublist(8)),
-                Uint8List.fromList(key));
+        final encrypted = keyBlockInfoCompressed is Uint8List
+            ? Uint8List.sublistView(keyBlockInfoCompressed, 8)
+            : Uint8List.fromList(keyBlockInfoCompressed.sublist(8));
+        _fastDecrypt(encrypted, Uint8List.fromList(key));
+        keyBlockInfo = zlib.decode(encrypted);
+      } else {
+        keyBlockInfo = zlib.decode(_sliceBytes(
+            keyBlockInfoCompressed, 8, keyBlockInfoCompressed.length));
       }
-
-      keyBlockInfo = zlib.decode(keyBlockInfoCompressed.sublist(8));
     } else {
       keyBlockInfo = keyBlockInfoCompressed;
     }
@@ -746,9 +940,7 @@ class DictReader {
       i += _numberWidth;
 
       // text head size
-      final textHeadSize = _readByte(
-          Uint8List.fromList(keyBlockInfo.sublist(i, i + byteWidth)),
-          byteWidth);
+      final textHeadSize = _readByte(keyBlockInfo, byteWidth, i);
       i += byteWidth;
 
       // text head
@@ -759,9 +951,7 @@ class DictReader {
       }
 
       // text tail size
-      final textTailSize = _readByte(
-          Uint8List.fromList(keyBlockInfo.sublist(i, i + byteWidth)),
-          byteWidth);
+      final textTailSize = _readByte(keyBlockInfo, byteWidth, i);
       i += byteWidth;
 
       // text tail
@@ -772,13 +962,10 @@ class DictReader {
       }
 
       // key block compressed size
-      final keyBlockCompressedSize = _readNumber(
-          Uint8List.fromList(keyBlockInfo.sublist(i, i + _numberWidth)),
-          _numberWidth);
+      final keyBlockCompressedSize = _readNumber(keyBlockInfo, _numberWidth, i);
       i += _numberWidth;
       // key block decompressed size
-      _readNumber(Uint8List.fromList(keyBlockInfo.sublist(i, i + _numberWidth)),
-          _numberWidth);
+      _readNumber(keyBlockInfo, _numberWidth, i);
       i += _numberWidth;
 
       keyBlockInfoList.add(keyBlockCompressedSize);
@@ -877,6 +1064,7 @@ class DictReader {
         _encoding = "UTF-8";
       }
     }
+    _configureEncoding();
 
     if (notify && _onHeaderRead != null) {
       _onHeaderRead!();
@@ -885,37 +1073,45 @@ class DictReader {
     return tags;
   }
 
+  Future<(int, int, int)> _readKeySectionHeader(RandomAccessFile f) async {
+    // v1 has four 4/8-byte fields; v2 adds the decompressed-info size and a
+    // four-byte checksum. Read the fixed header in one operation instead of
+    // issuing a separate asynchronous read for every field.
+    final headerSize =
+        _numberWidth * (_version >= 2.0 ? 5 : 4) + (_version >= 2.0 ? 4 : 0);
+    final bytes = await f.read(headerSize);
+    var offset = 0;
+
+    // number of key blocks
+    _readNumber(bytes, _numberWidth, offset);
+    offset += _numberWidth;
+
+    numEntries = _readNumber(bytes, _numberWidth, offset);
+    offset += _numberWidth;
+
+    // number of bytes of key block info after decompression
+    if (_version >= 2.0) {
+      offset += _numberWidth;
+    }
+
+    final keyBlockInfoSize = _readNumber(bytes, _numberWidth, offset);
+    offset += _numberWidth;
+    final keyBlockSize = _readNumber(bytes, _numberWidth, offset);
+
+    return (numEntries, keyBlockInfoSize, keyBlockSize);
+  }
+
   Future<List<(int, String)>> _readKeys() async {
     final f = _f!;
     await f.setPosition(_keyBlockOffset);
 
-    // number of key blocks
-    await _readNumberer(f);
-
-    // number of entries
-    numEntries = await _readNumberer(f);
-
-    // number of bytes of key block info after decompression
-    if (_version >= 2.0) {
-      await f.read(_numberWidth);
-    }
-
-    // number of bytes of key block info
-    final keyBlockInfoSize = await _readNumberer(f);
-    // number of bytes of key block
-    final keyBlockSize = await _readNumberer(f);
-
-    if (_version >= 2.0) {
-      await f.read(4);
-    }
-
+    final (_, keyBlockInfoSize, keyBlockSize) = await _readKeySectionHeader(f);
     final bytes = await f.read(keyBlockInfoSize);
-    List<int> keyBlockInfoList = _decodeKeyBlockInfo(bytes);
+    final keyBlockInfoList = _decodeKeyBlockInfo(bytes);
 
-    // read key block
-    final List<int> keyBlockCompressed = List.from(await f.read(keyBlockSize));
-
-    // extract key block
+    // Read the compressed key blocks once. _decodeKeyBlock uses typed views
+    // where possible, so this no longer makes an extra full-size copy.
+    final keyBlockCompressed = await f.read(keyBlockSize);
     final keyList = _decodeKeyBlock(keyBlockCompressed, keyBlockInfoList);
 
     _recordBlockOffset = await f.position();
@@ -927,63 +1123,57 @@ class DictReader {
     numberWidth ??= _numberWidth;
     final bytes = await file.read(numberWidth);
 
-    if (numberWidth == 4) {
-      return ByteData.sublistView(bytes).getUint32(0);
-    } else {
-      return ByteData.sublistView(bytes).getUint64(0);
-    }
+    return _readNumber(bytes, numberWidth);
   }
 
   Future<void> _skipKeys() async {
     final f = _f!;
     await f.setPosition(_keyBlockOffset);
 
-    await _readNumberer(f); // number of key blocks
-    numEntries = await _readNumberer(f);
-
-    if (_version >= 2.0) {
-      await f.read(_numberWidth); // decompressed key block info size
-    }
-
-    final keyBlockInfoSize = await _readNumberer(f);
-    final keyBlockSize = await _readNumberer(f);
-
-    if (_version >= 2.0) {
-      await f.read(4); // key block info checksum
-    }
-
+    final (_, keyBlockInfoSize, keyBlockSize) = await _readKeySectionHeader(f);
     final keyBlockOffset = await f.position();
     _recordBlockOffset = keyBlockOffset + keyBlockInfoSize + keyBlockSize;
     await f.setPosition(_recordBlockOffset);
+  }
+
+  Future<List<(int, int)>> _readRecordBlockInfoFromHandle(
+      RandomAccessFile f) async {
+    // The four record-section header fields and all block metadata are fixed
+    // width. Reading them in two chunks avoids 2 * blockCount tiny async IO
+    // operations for dictionaries with many record blocks.
+    final header = await f.read(_numberWidth * 4);
+    final numRecordBlocks = _readNumber(header, _numberWidth);
+    final infoBytes = await f.read(numRecordBlocks * _numberWidth * 2);
+    final recordBlockInfoList = <(int, int)>[];
+    var offset = 0;
+    for (var i = 0; i < numRecordBlocks; i++) {
+      final compressedSize = _readNumber(infoBytes, _numberWidth, offset);
+      offset += _numberWidth;
+      final decompressedSize = _readNumber(infoBytes, _numberWidth, offset);
+      offset += _numberWidth;
+      recordBlockInfoList.add((compressedSize, decompressedSize));
+    }
+    return recordBlockInfoList;
   }
 
   Future<void> _readRecordBlockInfo() async {
     final f = _f!;
     await f.setPosition(_recordBlockOffset);
 
-    final numRecordBlocks = await _readNumberer(f);
-    await _readNumberer(f); // number of entries
-    await _readNumberer(f); // size of record block info
-    await _readNumberer(f); // size of record block
-
-    // Read record block info section
-    _recordBlockInfoList = [];
-    _totalDecompressedSize = 0;
-    for (var i = 0; i < numRecordBlocks; i++) {
-      final compressedSize = await _readNumberer(f);
-      final decompressedSize = await _readNumberer(f);
-      _recordBlockInfoList!.add((compressedSize, decompressedSize));
-      _totalDecompressedSize = _totalDecompressedSize! + decompressedSize;
-    }
+    _recordBlockInfoList = await _readRecordBlockInfoFromHandle(f);
+    _totalDecompressedSize = _recordBlockInfoList!
+        .fold<int>(0, (total, blockInfo) => total + blockInfo.$2);
+    _buildRecordBlockIndex();
   }
 
   Stream<T> _readRecords<T>(
       T Function(String keyText, List<int> originalData,
               List<(int, int, int, int)> segments)
-          recordProcessor) async* {
+          recordProcessor,
+      {bool readData = true}) async* {
     final f = await _openReadHandle();
     try {
-      yield* _readRecordsFromHandle(f, recordProcessor);
+      yield* _readRecordsFromHandle(f, recordProcessor, readData: readData);
     } finally {
       await f.close();
     }
@@ -993,30 +1183,17 @@ class DictReader {
       RandomAccessFile f,
       T Function(String keyText, List<int> originalData,
               List<(int, int, int, int)> segments)
-          recordProcessor) async* {
+          recordProcessor,
+      {bool readData = true}) async* {
     await f.setPosition(_recordBlockOffset);
 
-    final numRecordBlocks = await _readNumberer(f);
-    // number of entries
-    await _readNumberer(f);
-
-    // size of record block info
-    await _readNumberer(f);
-    // size of record block
-    await _readNumberer(f);
-
-    final recordBlockInfoList = <(int, int)>[];
-    for (var i = 0; i < numRecordBlocks; i++) {
-      final compressedSize = await _readNumberer(f);
-      final decompressedSize = await _readNumberer(f);
-      recordBlockInfoList.add((compressedSize, decompressedSize));
-    }
-
+    final recordBlockInfoList = await _readRecordBlockInfoFromHandle(f);
     final totalDecompressedSize = recordBlockInfoList.fold<int>(
         0, (total, blockInfo) => total + blockInfo.$2);
     var offset = 0;
     var keyIndex = 0;
-    var recordBlockOffset = await f.position();
+    var recordBlockOffset = _recordBlockOffset + _numberWidth * 4;
+    recordBlockOffset += recordBlockInfoList.length * _numberWidth * 2;
     _PendingRecord? pendingRecord;
 
     for (var blockIndex = 0;
@@ -1035,7 +1212,9 @@ class DictReader {
             ? pendingRecord.end - blockStart
             : recordBlock.length;
         if (endOffset > 0) {
-          pendingRecord.data.addAll(recordBlock.sublist(0, endOffset));
+          if (readData) {
+            pendingRecord.data.addAll(recordBlock.sublist(0, endOffset));
+          }
           pendingRecord.segments
               .add((recordBlockOffset, 0, endOffset, compressedSize));
         }
@@ -1071,13 +1250,17 @@ class DictReader {
         final segments = <(int, int, int, int)>[
           (recordBlockOffset, startOffset, endOffset, compressedSize),
         ];
-        final originalData = recordBlock.sublist(startOffset, endOffset);
+        final originalData = readData
+            ? recordBlock.sublist(startOffset, endOffset)
+            : const <int>[];
         keyIndex++;
 
         if (recordEnd > blockEnd) {
           pendingRecord = _PendingRecord(keyText, recordEnd)
-            ..data.addAll(originalData)
             ..segments.addAll(segments);
+          if (readData) {
+            pendingRecord.data.addAll(originalData);
+          }
           break;
         }
 
@@ -1095,39 +1278,33 @@ class DictReader {
 
   List<(int, String)> _splitKeyBlock(List<int> keyBlock) {
     final List<(int, String)> keyList = [];
+    final Uint8List bytes =
+        keyBlock is Uint8List ? keyBlock : Uint8List.fromList(keyBlock);
+    final width = _isUtf16 ? 2 : 1;
+    final numberWidth = _numberWidth;
 
-    for (var keyStartIndex = 0; keyStartIndex < keyBlock.length;) {
-      // the corresponding record's offset in record block
-      final keyId = _readNumber(
-          Uint8List.fromList(
-              keyBlock.sublist(keyStartIndex, keyStartIndex + _numberWidth)),
-          _numberWidth);
+    for (var keyStartIndex = 0; keyStartIndex < bytes.length;) {
+      // The corresponding record's offset in the record block.
+      final keyId = _readNumber(bytes, numberWidth, keyStartIndex);
+      final keyTextStart = keyStartIndex + numberWidth;
 
-      var width = 1;
-
-      // key text ends with '\x00'
-      if (_isUtf16) {
-        width = 2;
+      // Find the terminator without allocating a sublist for every byte (or
+      // UTF-16 code unit). MDict uses a zero byte for single-byte encodings
+      // and two zero bytes for UTF-16 encodings.
+      final keyEndIndex = width == 1
+          ? _findByteTerminator(bytes, keyTextStart)
+          : _findUtf16Terminator(bytes, keyTextStart);
+      final hasTerminator = width == 1
+          ? keyEndIndex < bytes.length
+          : keyEndIndex + 1 < bytes.length;
+      if (!hasTerminator) {
+        throw const FormatException("Invalid key block terminator");
       }
 
-      late int keyEndIndex;
-
-      for (var i = keyStartIndex + _numberWidth;
-          i < keyBlock.length;
-          i += width) {
-        final sublist = keyBlock.sublist(i, i + width);
-        if (sublist.first == 0 && sublist.last == 0) {
-          keyEndIndex = i;
-          break;
-        }
-      }
-
-      final keyEncoded =
-          keyBlock.sublist(keyStartIndex + _numberWidth, keyEndIndex);
-      var keyText = _decodeText(keyEncoded);
+      final keyEncoded = _sliceBytes(bytes, keyTextStart, keyEndIndex);
+      final keyText = _decodeText(keyEncoded);
 
       keyStartIndex = keyEndIndex + width;
-
       keyList.add((keyId, keyText));
     }
 
@@ -1322,6 +1499,7 @@ Future<_DictInitData> _initDictIsolate(
   reader._numberWidth = numberWidth;
   reader._encrypt = encrypt;
   reader._encoding = encoding;
+  reader._configureEncoding();
 
   if (readKeys) {
     initData.keyList = await reader._readKeys();
