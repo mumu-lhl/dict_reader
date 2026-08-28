@@ -54,6 +54,7 @@ class DictReader {
   late bool _mdx;
   late double _version;
   late String _encoding;
+  bool _headerLoaded = false;
   File? _dict;
   late List<(int, String)> _keyList;
   late List<(int, String, int)> _lookupKeyList;
@@ -69,7 +70,7 @@ class DictReader {
 
   /// [_path] File path
   DictReader(this._path) {
-    _mdx = _path.substring(_path.lastIndexOf(".")) == ".mdx";
+    _mdx = _path.toLowerCase().endsWith(".mdx");
   }
 
   /// Initialize
@@ -77,9 +78,11 @@ class DictReader {
   /// Will not read key if [readKey] is false to reduce initialization time.
   @Deprecated("Use initDict instead.")
   Future<void> init([bool readKey = true]) async {
+    await close();
     _dict = File(_path);
     _f = await _dict!.open();
     header = await _readHeader();
+    _headerLoaded = true;
     if (readKey) {
       _keyList = await _readKeys();
       _rebuildLookupKeyList();
@@ -96,16 +99,17 @@ class DictReader {
       {bool readKeys = true,
       bool readRecordBlockInfo = true,
       bool readHeader = true}) async {
-    if (_dict == null) {
+    if (_f == null) {
       _dict = File(_path);
       _f = await _dict!.open();
     }
 
-    if (readHeader) {
-      header = await _readHeader();
+    if (readHeader || (!_headerLoaded && (readKeys || readRecordBlockInfo))) {
+      header = await _readHeader(notify: readHeader);
+      _headerLoaded = true;
     }
 
-    if (readKeys) {
+    if (readKeys || readRecordBlockInfo) {
       final path = _path;
       final keyBlockOffset = _keyBlockOffset;
       final version = _version;
@@ -122,8 +126,10 @@ class DictReader {
           encrypt,
           encoding));
 
-      _keyList = initData.keyList!;
-      _rebuildLookupKeyList();
+      if (readKeys) {
+        _keyList = initData.keyList!;
+        _rebuildLookupKeyList();
+      }
       numEntries = initData.numEntries!;
       _recordBlockOffset = initData.recordBlockOffset!;
 
@@ -140,8 +146,13 @@ class DictReader {
 
   /// Closes the dictionary file.
   Future<void> close() async {
-    await _f?.close();
+    final file = _f;
     _f = null;
+    await file?.close();
+    _dict = null;
+    _headerLoaded = false;
+    _recordBlockInfoList = null;
+    _totalDecompressedSize = null;
   }
 
   /// Exports the cache data as a map.
@@ -174,6 +185,15 @@ class DictReader {
   /// the need to re-read and process the dictionary file. This operation is
   /// performed in an isolate.
   Future<void> importCache(Map<String, dynamic> cacheData) async {
+    if (_f == null) {
+      _dict = File(_path);
+      _f = await _dict!.open();
+    }
+    if (!_headerLoaded) {
+      header = await _readHeader();
+      _headerLoaded = true;
+    }
+
     final importedData =
         await Isolate.run(() => _importCacheIsolate(cacheData));
     _keyList = importedData['keyList'] as List<(int, String)>;
@@ -217,6 +237,19 @@ class DictReader {
   /// The first member of the returned record is the key text.
   @Deprecated("Use readWithMdxData and readWithMddData instead.")
   Stream<(String, dynamic)> read([bool returnData = false]) async* {
+    if (returnData) {
+      if (_mdx) {
+        await for (final record in readWithMdxData()) {
+          yield (record.keyText, record.data);
+        }
+      } else {
+        await for (final record in readWithMddData()) {
+          yield (record.keyText, record.data);
+        }
+      }
+      return;
+    }
+
     final f = _f!;
     await f.setPosition(_recordBlockOffset);
 
@@ -307,20 +340,41 @@ class DictReader {
     return data;
   }
 
+  Future<List<int>> _readRecordData(RecordOffsetInfo recordOffsetInfo) async {
+    final f = _f!;
+    final segments = recordOffsetInfo.segments.isEmpty
+        ? <(int, int, int, int)>[
+            (
+              recordOffsetInfo.recordBlockOffset,
+              recordOffsetInfo.startOffset,
+              recordOffsetInfo.endOffset,
+              recordOffsetInfo.compressedSize,
+            )
+          ]
+        : recordOffsetInfo.segments;
+    final data = BytesBuilder();
+
+    for (final segment in segments) {
+      if (segment.$2 < 0 || segment.$3 < segment.$2) {
+        throw FormatException("Invalid record offset");
+      }
+      await f.setPosition(segment.$1);
+      final recordBlock = _decodeBlock(await f.read(segment.$4));
+      if (segment.$3 > recordBlock.length) {
+        throw FormatException("Record offset exceeds record block");
+      }
+      data.add(recordBlock.sublist(segment.$2, segment.$3));
+    }
+
+    return data.toBytes();
+  }
+
   /// Only reads a mdd file's one record.
   ///
   /// [recordOffsetInfo] is obtained from [readWithOffset].
   /// Returns `List<int>`.
-  Future<List<int>> readOneMdd(RecordOffsetInfo recordOffsetInfo) async {
-    final f = _f!;
-    await f.setPosition(recordOffsetInfo.recordBlockOffset);
-
-    final recordBlock =
-        _decodeBlock(await f.read(recordOffsetInfo.compressedSize));
-    final data = recordBlock.sublist(
-        recordOffsetInfo.startOffset, recordOffsetInfo.endOffset);
-
-    return data;
+  Future<List<int>> readOneMdd(RecordOffsetInfo recordOffsetInfo) {
+    return _readRecordData(recordOffsetInfo);
   }
 
   /// Only reads a mdx file's one record.
@@ -329,23 +383,15 @@ class DictReader {
   /// Returns `String` if file format is mdx.
   /// Returns `List<int>` if file format is mdd.
   Future<String> readOneMdx(RecordOffsetInfo recordOffsetInfo) async {
-    final f = _f!;
-    await f.setPosition(recordOffsetInfo.recordBlockOffset);
-
-    final recordBlock =
-        _decodeBlock(await f.read(recordOffsetInfo.compressedSize));
-    final data = _treatRecordMdxData(recordBlock.sublist(
-        recordOffsetInfo.startOffset, recordOffsetInfo.endOffset));
-
-    return data;
+    final data = await _readRecordData(recordOffsetInfo);
+    return _treatRecordMdxData(data);
   }
 
   /// Reads records from an MDD file and returns a stream of [MddRecord] objects.
   ///
   /// Each [MddRecord] contains the key text and the raw MDD data (`List<int>`).
   Stream<MddRecord> readWithMddData() async* {
-    yield* _readRecords((keyText, originalData, recordBlockOffset, startOffset,
-        endOffset, compressedSize) {
+    yield* _readRecords((keyText, originalData, segments) {
       return MddRecord(keyText, originalData);
     });
   }
@@ -354,8 +400,7 @@ class DictReader {
   ///
   /// Each [MdxRecord] contains the key text and the processed MDX data.
   Stream<MdxRecord> readWithMdxData() async* {
-    yield* _readRecords((keyText, originalData, recordBlockOffset, startOffset,
-        endOffset, compressedSize) {
+    yield* _readRecords((keyText, originalData, segments) {
       final data = _treatRecordMdxData(originalData);
       return MdxRecord(keyText, data);
     });
@@ -367,10 +412,16 @@ class DictReader {
   /// `endOffset`, and `compressedSize` which can be used to read the record data
   /// later using [readOneMdx] or [readOneMdd].
   Stream<RecordOffsetInfo> readWithOffset() async* {
-    yield* _readRecords((keyText, originalData, recordBlockOffset, startOffset,
-        endOffset, compressedSize) {
-      return (RecordOffsetInfo(
-          keyText, recordBlockOffset, startOffset, endOffset, compressedSize));
+    yield* _readRecords((keyText, originalData, segments) {
+      final firstSegment = segments.first;
+      return RecordOffsetInfo(
+        keyText,
+        firstSegment.$1,
+        firstSegment.$2,
+        firstSegment.$3,
+        firstSegment.$4,
+        segments: segments,
+      );
     });
   }
 
@@ -391,35 +442,7 @@ class DictReader {
     final recordEnd = (physicalIndex < _keyList.length - 1)
         ? _keyList[physicalIndex + 1].$1
         : -1; // -1 indicates the last record
-
-    final actualRecordEnd =
-        (recordEnd == -1) ? _totalDecompressedSize! : recordEnd;
-
-    // Locate the correct block
-    int accumulatedDecompressedSize = 0;
-    // The file offset of the first record block.
-    var recordBlockFileOffset = _recordBlockOffset + _numberWidth * 4;
-    recordBlockFileOffset += _recordBlockInfoList!.length * _numberWidth * 2;
-
-    for (final blockInfo in _recordBlockInfoList!) {
-      final compressedSize = blockInfo.$1;
-      final decompressedSize = blockInfo.$2;
-
-      if (recordStart < accumulatedDecompressedSize + decompressedSize) {
-        final startOffset = recordStart - accumulatedDecompressedSize;
-        var endOffset = actualRecordEnd - accumulatedDecompressedSize;
-        if (endOffset > decompressedSize) {
-          endOffset = decompressedSize;
-        }
-        return RecordOffsetInfo(
-            key, recordBlockFileOffset, startOffset, endOffset, compressedSize);
-      }
-
-      accumulatedDecompressedSize += decompressedSize;
-      recordBlockFileOffset += compressedSize;
-    }
-
-    return null; // Should not happen if key is in _keyList
+    return _buildRecordOffsetInfo(key, recordStart, recordEnd);
   }
 
   /// Locates the position information of all occurrences of a key (word).
@@ -437,7 +460,6 @@ class DictReader {
       return [];
     }
 
-    // Iterate through all keys that match
     while (keyIndex < _lookupKeyList.length &&
         _lookupKeyList[keyIndex].$2 == key) {
       final physicalIndex = _lookupKeyList[keyIndex].$3;
@@ -445,33 +467,9 @@ class DictReader {
       final recordEnd = (physicalIndex < _keyList.length - 1)
           ? _keyList[physicalIndex + 1].$1
           : -1; // -1 indicates the last record
-
-      final actualRecordEnd =
-          (recordEnd == -1) ? _totalDecompressedSize! : recordEnd;
-
-      // Locate the correct block
-      int accumulatedDecompressedSize = 0;
-      // The file offset of the first record block.
-      var recordBlockFileOffset = _recordBlockOffset + _numberWidth * 4;
-      recordBlockFileOffset += _recordBlockInfoList!.length * _numberWidth * 2;
-
-      for (final blockInfo in _recordBlockInfoList!) {
-        final compressedSize = blockInfo.$1;
-        final decompressedSize = blockInfo.$2;
-
-        if (recordStart < accumulatedDecompressedSize + decompressedSize) {
-          final startOffset = recordStart - accumulatedDecompressedSize;
-          var endOffset = actualRecordEnd - accumulatedDecompressedSize;
-          if (endOffset > decompressedSize) {
-            endOffset = decompressedSize;
-          }
-          results.add(RecordOffsetInfo(key, recordBlockFileOffset, startOffset,
-              endOffset, compressedSize));
-          break; // Found the block for this key, move to the next key
-        }
-
-        accumulatedDecompressedSize += decompressedSize;
-        recordBlockFileOffset += compressedSize;
+      final offsetInfo = _buildRecordOffsetInfo(key, recordStart, recordEnd);
+      if (offsetInfo != null) {
+        results.add(offsetInfo);
       }
       keyIndex++;
     }
@@ -511,6 +509,61 @@ class DictReader {
     });
   }
 
+  RecordOffsetInfo? _buildRecordOffsetInfo(
+      String key, int recordStart, int recordEnd) {
+    final blockInfoList = _recordBlockInfoList;
+    if (blockInfoList == null) {
+      return null;
+    }
+
+    final actualRecordEnd =
+        recordEnd == -1 ? _totalDecompressedSize! : recordEnd;
+    if (recordStart < 0 || actualRecordEnd < recordStart) {
+      return null;
+    }
+
+    final segments = <(int, int, int, int)>[];
+    var accumulatedDecompressedSize = 0;
+    var recordBlockFileOffset = _recordBlockOffset + _numberWidth * 4;
+    recordBlockFileOffset += blockInfoList.length * _numberWidth * 2;
+
+    for (final blockInfo in blockInfoList) {
+      final compressedSize = blockInfo.$1;
+      final decompressedSize = blockInfo.$2;
+      final blockStart = accumulatedDecompressedSize;
+      final blockEnd = blockStart + decompressedSize;
+
+      if (recordStart < blockEnd && actualRecordEnd > blockStart) {
+        final startOffset =
+            recordStart > blockStart ? recordStart - blockStart : 0;
+        final endOffset = actualRecordEnd < blockEnd
+            ? actualRecordEnd - blockStart
+            : decompressedSize;
+        if (endOffset >= startOffset) {
+          segments.add(
+              (recordBlockFileOffset, startOffset, endOffset, compressedSize));
+        }
+      }
+
+      accumulatedDecompressedSize = blockEnd;
+      recordBlockFileOffset += compressedSize;
+    }
+
+    if (segments.isEmpty) {
+      return null;
+    }
+
+    final firstSegment = segments.first;
+    return RecordOffsetInfo(
+      key,
+      firstSegment.$1,
+      firstSegment.$2,
+      firstSegment.$3,
+      firstSegment.$4,
+      segments: segments,
+    );
+  }
+
   /// Collects all matching keys starting from a given index.
   List<String> _collectMatches(
       List<(int, String, int)> list, String key, int startIndex, int? limit) {
@@ -528,6 +581,105 @@ class DictReader {
       }
     }
     return matchedKeys;
+  }
+
+  bool get _isUtf16 {
+    final encoding = _encoding.toUpperCase();
+    return encoding == "UTF-16" ||
+        encoding == "UTF-16LE" ||
+        encoding == "UTF-16BE";
+  }
+
+  String _decodeUtf8IgnoringMalformed(List<int> data) {
+    final codePoints = <int>[];
+    var i = 0;
+
+    bool isContinuation(int index) {
+      return index < data.length && (data[index] & 0xc0) == 0x80;
+    }
+
+    while (i < data.length) {
+      final first = data[i];
+      if (first <= 0x7f) {
+        codePoints.add(first);
+        i++;
+        continue;
+      }
+
+      var length = 0;
+      var codePoint = 0;
+      if (first >= 0xc2 && first <= 0xdf && isContinuation(i + 1)) {
+        length = 2;
+        codePoint = first & 0x1f;
+      } else if (first >= 0xe0 &&
+          first <= 0xef &&
+          isContinuation(i + 1) &&
+          isContinuation(i + 2) &&
+          !(first == 0xe0 && data[i + 1] < 0xa0) &&
+          !(first == 0xed && data[i + 1] >= 0xa0)) {
+        length = 3;
+        codePoint = first & 0x0f;
+      } else if (first >= 0xf0 &&
+          first <= 0xf4 &&
+          isContinuation(i + 1) &&
+          isContinuation(i + 2) &&
+          isContinuation(i + 3) &&
+          !(first == 0xf0 && data[i + 1] < 0x90) &&
+          !(first == 0xf4 && data[i + 1] > 0x8f)) {
+        length = 4;
+        codePoint = first & 0x07;
+      }
+
+      if (length == 0) {
+        i++;
+        continue;
+      }
+
+      for (var j = 1; j < length; j++) {
+        codePoint = (codePoint << 6) | (data[i + j] & 0x3f);
+      }
+      codePoints.add(codePoint);
+      i += length;
+    }
+
+    return String.fromCharCodes(codePoints);
+  }
+
+  String _decodeText(List<int> data) {
+    final encoding = _encoding.toUpperCase();
+    if (encoding == "UTF-16BE") {
+      return Utf16Decoder().decodeUtf16Be(data);
+    }
+    if (encoding == "UTF-16" || encoding == "UTF-16LE") {
+      return Utf16Decoder().decodeUtf16Le(data);
+    }
+    if (encoding == "UTF-8" || encoding == "UTF8") {
+      return _decodeUtf8IgnoringMalformed(data);
+    }
+
+    final codec = Charset.getByName(_encoding);
+    if (codec == null) {
+      throw FormatException("Unsupported dictionary encoding: $_encoding");
+    }
+    if (codec is GbkCodec) {
+      return codec.decode(data, allowMalformed: true);
+    }
+    if (codec is CodePage) {
+      return codec.decode(data, allowInvalid: true);
+    }
+    return codec.decode(data);
+  }
+
+  String _stripNul(String value) {
+    var start = 0;
+    var end = value.length;
+    while (start < end && value.codeUnitAt(start) == 0) {
+      start++;
+    }
+    while (end > start && value.codeUnitAt(end - 1) == 0) {
+      end--;
+    }
+    return value.substring(start, end);
   }
 
   List<int> _decodeBlock(List<int> block) {
@@ -569,7 +721,7 @@ class DictReader {
     List<int> keyBlockInfo;
 
     if (_version >= 2.0) {
-      if (_encrypt == 2) {
+      if ((_encrypt & 0x02) != 0) {
         final key = RIPEMD128
             .hash(keyBlockInfoCompressed.sublist(4, 8) + [149, 54, 0, 0]);
         keyBlockInfoCompressed = keyBlockInfoCompressed.sublist(0, 8) +
@@ -602,7 +754,7 @@ class DictReader {
       i += byteWidth;
 
       // text head
-      if (_encoding != "UTF-16") {
+      if (!_isUtf16) {
         i += textHeadSize + textTerm;
       } else {
         i += (textHeadSize + textTerm) * 2;
@@ -615,7 +767,7 @@ class DictReader {
       i += byteWidth;
 
       // text tail
-      if (_encoding != "UTF-16") {
+      if (!_isUtf16) {
         i += textTailSize + textTerm;
       } else {
         i += (textTailSize + textTerm) * 2;
@@ -651,8 +803,9 @@ class DictReader {
     return tagDict;
   }
 
-  Future<Map<String, String>> _readHeader() async {
+  Future<Map<String, String>> _readHeader({bool notify = true}) async {
     final f = _f!;
+    await f.setPosition(0);
     var headerBytesSize = await _readNumberer(f, 4);
 
     var contentBytes = await f.read(headerBytesSize);
@@ -679,7 +832,7 @@ class DictReader {
       }
     }
     // GB18030 > GBK > GB2312
-    if (["GBK", "GB2312"].contains(encoding)) {
+    if (["GBK", "GB2312"].contains(encoding.toUpperCase())) {
       encoding = "GB18030";
     }
     _encoding = encoding;
@@ -702,6 +855,7 @@ class DictReader {
     //   style_end    # or ''
     // store stylesheet in dict in the form of
     // {'number' : ('style_begin', 'style_end')}
+    _stylesheet.clear();
     final stylesheetString = tags["StyleSheet"];
     if (stylesheetString != null) {
       final unescape = HtmlUnescape();
@@ -726,7 +880,7 @@ class DictReader {
       }
     }
 
-    if (_onHeaderRead != null) {
+    if (notify && _onHeaderRead != null) {
       _onHeaderRead!();
     }
 
@@ -782,6 +936,29 @@ class DictReader {
     }
   }
 
+  Future<void> _skipKeys() async {
+    final f = _f!;
+    await f.setPosition(_keyBlockOffset);
+
+    await _readNumberer(f); // number of key blocks
+    numEntries = await _readNumberer(f);
+
+    if (_version >= 2.0) {
+      await f.read(_numberWidth); // decompressed key block info size
+    }
+
+    final keyBlockInfoSize = await _readNumberer(f);
+    final keyBlockSize = await _readNumberer(f);
+
+    if (_version >= 2.0) {
+      await f.read(4); // key block info checksum
+    }
+
+    final keyBlockOffset = await f.position();
+    _recordBlockOffset = keyBlockOffset + keyBlockInfoSize + keyBlockSize;
+    await f.setPosition(_recordBlockOffset);
+  }
+
   Future<void> _readRecordBlockInfo() async {
     final f = _f!;
     await f.setPosition(_recordBlockOffset);
@@ -803,8 +980,8 @@ class DictReader {
   }
 
   Stream<T> _readRecords<T>(
-      T Function(String keyText, List<int> originalData, int recordBlockOffset,
-              int startOffset, int endOffset, int compressedSize)
+      T Function(String keyText, List<int> originalData,
+              List<(int, int, int, int)> segments)
           recordProcessor) async* {
     final f = _f!;
     await f.setPosition(_recordBlockOffset);
@@ -818,55 +995,91 @@ class DictReader {
     // size of record block
     await _readNumberer(f);
 
-    // record block info section
-    final List<int> recordBlockLnfoList = [];
-
+    final recordBlockInfoList = <(int, int)>[];
     for (var i = 0; i < numRecordBlocks; i++) {
       final compressedSize = await _readNumberer(f);
-      // record block decompressed size
-      await _readNumberer(f);
-
-      recordBlockLnfoList.add(compressedSize);
+      final decompressedSize = await _readNumberer(f);
+      recordBlockInfoList.add((compressedSize, decompressedSize));
     }
 
-    // actual record block
+    final totalDecompressedSize = recordBlockInfoList.fold<int>(
+        0, (total, blockInfo) => total + blockInfo.$2);
     var offset = 0;
-    var i = 0;
+    var keyIndex = 0;
     var recordBlockOffset = await f.position();
+    _PendingRecord? pendingRecord;
 
-    for (final compressedSize in recordBlockLnfoList) {
+    for (var blockIndex = 0;
+        blockIndex < recordBlockInfoList.length;
+        blockIndex++) {
+      final (compressedSize, _) = recordBlockInfoList[blockIndex];
       final recordBlock = _decodeBlock(await f.read(compressedSize));
+      final blockStart = offset;
+      final blockEnd = blockStart + recordBlock.length;
 
-      // split record block according to the offset info from key block
-      while (i < _keyList.length) {
-        final (recordStart, keyText) = _keyList[i];
+      if (pendingRecord != null) {
+        if (pendingRecord.end < blockStart) {
+          throw FormatException("Record offset is out of order");
+        }
+        final endOffset = pendingRecord.end < blockEnd
+            ? pendingRecord.end - blockStart
+            : recordBlock.length;
+        if (endOffset > 0) {
+          pendingRecord.data.addAll(recordBlock.sublist(0, endOffset));
+          pendingRecord.segments
+              .add((recordBlockOffset, 0, endOffset, compressedSize));
+        }
+        if (pendingRecord.end <= blockEnd) {
+          final completedRecord = pendingRecord;
+          pendingRecord = null;
+          yield recordProcessor(completedRecord.keyText, completedRecord.data,
+              completedRecord.segments);
+        }
+      }
 
-        // reach the end of current record block
-        if (recordStart - offset >= recordBlock.length) {
+      while (keyIndex < _keyList.length) {
+        final (recordStart, keyText) = _keyList[keyIndex];
+        if (recordStart >= blockEnd) {
+          break;
+        }
+        if (recordStart < blockStart) {
+          throw FormatException("Record offsets are not sorted");
+        }
+
+        final recordEnd = keyIndex < _keyList.length - 1
+            ? _keyList[keyIndex + 1].$1
+            : (blockIndex == recordBlockInfoList.length - 1
+                ? blockEnd
+                : totalDecompressedSize);
+        if (recordEnd < recordStart) {
+          throw FormatException("Record offsets are not sorted");
+        }
+
+        final startOffset = recordStart - blockStart;
+        final endOffset =
+            recordEnd < blockEnd ? recordEnd - blockStart : recordBlock.length;
+        final segments = <(int, int, int, int)>[
+          (recordBlockOffset, startOffset, endOffset, compressedSize),
+        ];
+        final originalData = recordBlock.sublist(startOffset, endOffset);
+        keyIndex++;
+
+        if (recordEnd > blockEnd) {
+          pendingRecord = _PendingRecord(keyText, recordEnd)
+            ..data.addAll(originalData)
+            ..segments.addAll(segments);
           break;
         }
 
-        // record end index
-        int recordEnd;
-
-        if (i < _keyList.length - 1) {
-          recordEnd = _keyList[i + 1].$1;
-        } else {
-          recordEnd = recordBlock.length + offset;
-        }
-
-        i += 1;
-
-        final startOffset = recordStart - offset;
-        final endOffset = recordEnd - offset;
-        final originalData = recordBlock.sublist(startOffset, endOffset);
-
-        yield recordProcessor(keyText, originalData, recordBlockOffset,
-            startOffset, endOffset, compressedSize);
+        yield recordProcessor(keyText, originalData, segments);
       }
 
-      offset += recordBlock.length;
+      offset = blockEnd;
       recordBlockOffset += compressedSize;
+    }
+
+    if (pendingRecord != null || keyIndex < _keyList.length) {
+      throw FormatException("Record offsets exceed record blocks");
     }
   }
 
@@ -883,7 +1096,7 @@ class DictReader {
       var width = 1;
 
       // key text ends with '\x00'
-      if (_encoding == "UTF-16") {
+      if (_isUtf16) {
         width = 2;
       }
 
@@ -901,20 +1114,7 @@ class DictReader {
 
       final keyEncoded =
           keyBlock.sublist(keyStartIndex + _numberWidth, keyEndIndex);
-      String keyText;
-
-      if (_encoding == "UTF-16") {
-        keyText = Utf16Decoder().decodeUtf16Le(keyEncoded);
-
-        if (!_mdx) {
-          keyText = keyText.replaceAll("\\", "/");
-          if (keyText[0] == "/") {
-            keyText = keyText.substring(1);
-          }
-        }
-      } else {
-        keyText = utf8.decode(keyEncoded);
-      }
+      var keyText = _decodeText(keyEncoded);
 
       keyStartIndex = keyEndIndex + width;
 
@@ -950,13 +1150,7 @@ class DictReader {
   }
 
   String _treatRecordMdxData(List<int> data) {
-    String dataReturned;
-
-    if (_encoding == "UTF-16") {
-      dataReturned = Utf16Decoder().decodeUtf16Le(data);
-    } else {
-      dataReturned = utf8.decode(data);
-    }
+    var dataReturned = _stripNul(_decodeText(data));
 
     if (_stylesheet.isNotEmpty) {
       dataReturned = _substituteStylesheet(dataReturned);
@@ -1017,9 +1211,26 @@ class RecordOffsetInfo {
   /// The compressed size of the record block containing this record.
   final int compressedSize;
 
+  /// All record block segments containing this record.
+  ///
+  /// This is empty for instances created with the original constructor shape.
+  /// When a record spans multiple blocks, the segments are needed by
+  /// [readOneMdx] and [readOneMdd] to reconstruct the complete record.
+  final List<(int, int, int, int)> segments;
+
   /// Creates a new [RecordOffsetInfo] instance.
   const RecordOffsetInfo(this.keyText, this.recordBlockOffset, this.startOffset,
-      this.endOffset, this.compressedSize);
+      this.endOffset, this.compressedSize,
+      {this.segments = const []});
+}
+
+class _PendingRecord {
+  final String keyText;
+  final int end;
+  final List<int> data = [];
+  final List<(int, int, int, int)> segments = [];
+
+  _PendingRecord(this.keyText, this.end);
 }
 
 class _DictInitData {
@@ -1099,11 +1310,16 @@ Future<_DictInitData> _initDictIsolate(
     initData.keyList = await reader._readKeys();
     initData.numEntries = reader.numEntries;
     initData.recordBlockOffset = reader._recordBlockOffset;
-    if (readRecordBlockInfo) {
-      await reader._readRecordBlockInfo();
-      initData.recordBlockInfoList = reader._recordBlockInfoList;
-      initData.totalDecompressedSize = reader._totalDecompressedSize;
-    }
+  } else if (readRecordBlockInfo) {
+    await reader._skipKeys();
+    initData.numEntries = reader.numEntries;
+    initData.recordBlockOffset = reader._recordBlockOffset;
+  }
+
+  if (readRecordBlockInfo) {
+    await reader._readRecordBlockInfo();
+    initData.recordBlockInfoList = reader._recordBlockInfoList;
+    initData.totalDecompressedSize = reader._totalDecompressedSize;
   }
 
   await reader.close();
