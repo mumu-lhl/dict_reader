@@ -56,6 +56,7 @@ class DictReader {
   late String _encoding;
   File? _dict;
   late List<(int, String)> _keyList;
+  late List<(int, String, int)> _lookupKeyList;
   late int _encrypt;
   RandomAccessFile? _f;
   List<(int, int)>? _recordBlockInfoList;
@@ -81,6 +82,7 @@ class DictReader {
     header = await _readHeader();
     if (readKey) {
       _keyList = await _readKeys();
+      _rebuildLookupKeyList();
       await _readRecordBlockInfo();
     }
   }
@@ -121,6 +123,7 @@ class DictReader {
           encoding));
 
       _keyList = initData.keyList!;
+      _rebuildLookupKeyList();
       numEntries = initData.numEntries!;
       _recordBlockOffset = initData.recordBlockOffset!;
 
@@ -174,6 +177,7 @@ class DictReader {
     final importedData =
         await Isolate.run(() => _importCacheIsolate(cacheData));
     _keyList = importedData['keyList'] as List<(int, String)>;
+    _rebuildLookupKeyList();
     numEntries = importedData['numEntries'];
     _recordBlockOffset = importedData['recordBlockOffset'];
     _recordBlockInfoList =
@@ -375,16 +379,17 @@ class DictReader {
   /// This method can be used to get the content of a key after initialization.
   /// Returns `null` if the key is not found.
   Future<RecordOffsetInfo?> locate(String key) async {
-    final keyIndex = binarySearch(_keyList, (0, key),
+    final keyIndex = binarySearch(_lookupKeyList, (0, key, 0),
         compare: (a, b) => a.$2.compareTo(b.$2));
 
     if (keyIndex < 0) {
       return null;
     }
 
-    final recordStart = _keyList[keyIndex].$1;
-    final recordEnd = (keyIndex < _keyList.length - 1)
-        ? _keyList[keyIndex + 1].$1
+    final physicalIndex = _lookupKeyList[keyIndex].$3;
+    final recordStart = _keyList[physicalIndex].$1;
+    final recordEnd = (physicalIndex < _keyList.length - 1)
+        ? _keyList[physicalIndex + 1].$1
         : -1; // -1 indicates the last record
 
     final actualRecordEnd =
@@ -424,18 +429,21 @@ class DictReader {
   Future<List<RecordOffsetInfo>> locateAll(String key) async {
     final results = <RecordOffsetInfo>[];
     // Use lowerBound to find the first potential match.
-    var keyIndex =
-        lowerBound(_keyList, (0, key), compare: (a, b) => a.$2.compareTo(b.$2));
+    var keyIndex = lowerBound(_lookupKeyList, (0, key, 0),
+        compare: (a, b) => a.$2.compareTo(b.$2));
 
-    if (keyIndex == _keyList.length || _keyList[keyIndex].$2 != key) {
+    if (keyIndex == _lookupKeyList.length ||
+        _lookupKeyList[keyIndex].$2 != key) {
       return [];
     }
 
     // Iterate through all keys that match
-    while (keyIndex < _keyList.length && _keyList[keyIndex].$2 == key) {
-      final recordStart = _keyList[keyIndex].$1;
-      final recordEnd = (keyIndex < _keyList.length - 1)
-          ? _keyList[keyIndex + 1].$1
+    while (keyIndex < _lookupKeyList.length &&
+        _lookupKeyList[keyIndex].$2 == key) {
+      final physicalIndex = _lookupKeyList[keyIndex].$3;
+      final recordStart = _keyList[physicalIndex].$1;
+      final recordEnd = (physicalIndex < _keyList.length - 1)
+          ? _keyList[physicalIndex + 1].$1
           : -1; // -1 indicates the last record
 
       final actualRecordEnd =
@@ -477,24 +485,35 @@ class DictReader {
   /// Returns an empty list if the key is not found.
   List<String> search(String key, {int? limit}) {
     // Use lowerBound to find the first potential match.
-    final firstMatchIndex =
-        lowerBound(_keyList, (0, key), compare: (a, b) => a.$2.compareTo(b.$2));
+    final firstMatchIndex = lowerBound(_lookupKeyList, (0, key, 0),
+        compare: (a, b) => a.$2.compareTo(b.$2));
 
-    return _collectMatches(_keyList, key, firstMatchIndex, limit);
+    return _collectMatches(_lookupKeyList, key, firstMatchIndex, limit);
   }
 
   /// Checks if a key (word) exists in the dictionary.
   ///
   /// Returns `true` if the key is found, otherwise `false`.
   bool exist(String key) {
-    final keyIndex = binarySearch(_keyList, (0, key),
+    final keyIndex = binarySearch(_lookupKeyList, (0, key, 0),
         compare: (a, b) => a.$2.compareTo(b.$2));
     return keyIndex >= 0;
   }
 
+  void _rebuildLookupKeyList() {
+    _lookupKeyList = [
+      for (var i = 0; i < _keyList.length; i++)
+        (_keyList[i].$1, _keyList[i].$2, i),
+    ];
+    mergeSort(_lookupKeyList, compare: (a, b) {
+      final keyComparison = a.$2.compareTo(b.$2);
+      return keyComparison != 0 ? keyComparison : a.$3.compareTo(b.$3);
+    });
+  }
+
   /// Collects all matching keys starting from a given index.
   List<String> _collectMatches(
-      List<(int, String)> list, String key, int startIndex, int? limit) {
+      List<(int, String, int)> list, String key, int startIndex, int? limit) {
     final matchedKeys = <String>[];
     for (var i = startIndex; i < list.length; i++) {
       if (limit != null && matchedKeys.length >= limit) {
@@ -746,8 +765,6 @@ class DictReader {
 
     // extract key block
     final keyList = _decodeKeyBlock(keyBlockCompressed, keyBlockInfoList);
-
-    mergeSort(keyList, compare: (a, b) => a.$2.compareTo(b.$2));
 
     _recordBlockOffset = await f.position();
 
