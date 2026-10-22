@@ -70,14 +70,16 @@ class StarDictFixtureBuilder {
       idx.addByte(0);
       final (offset, size) = locations[i];
       if (offsetBits == 64) {
-        idx.add((ByteData(8)..setUint64(0, offset, Endian.big)).buffer
+        idx.add((ByteData(8)..setUint64(0, offset, Endian.big))
+            .buffer
             .asUint8List());
       } else {
-        idx.add((ByteData(4)..setUint32(0, offset, Endian.big)).buffer
+        idx.add((ByteData(4)..setUint32(0, offset, Endian.big))
+            .buffer
             .asUint8List());
       }
-      idx.add((ByteData(4)..setUint32(0, size, Endian.big)).buffer
-          .asUint8List());
+      idx.add(
+          (ByteData(4)..setUint32(0, size, Endian.big)).buffer.asUint8List());
     }
     final idxData = idx.takeBytes();
 
@@ -95,7 +97,8 @@ class StarDictFixtureBuilder {
       for (final (word, target) in synonyms) {
         syn.add(utf8.encode(word));
         syn.addByte(0);
-        syn.add((ByteData(4)..setUint32(0, target, Endian.big)).buffer
+        syn.add((ByteData(4)..setUint32(0, target, Endian.big))
+            .buffer
             .asUint8List());
       }
       await File('$base.syn').writeAsBytes(syn.takeBytes());
@@ -124,16 +127,17 @@ class StarDictFixtureBuilder {
 Uint8List buildDictZip(Uint8List data, {required int chunkLength}) {
   final chunks = <Uint8List>[];
   for (var start = 0; start < data.length; start += chunkLength) {
-    final end = start + chunkLength > data.length
-        ? data.length
-        : start + chunkLength;
+    final end =
+        start + chunkLength > data.length ? data.length : start + chunkLength;
     chunks.add(
       Uint8List.fromList(
         ZLibEncoder(raw: true).convert(Uint8List.sublistView(data, start, end)),
       ),
     );
   }
-  if (chunks.isEmpty) chunks.add(Uint8List.fromList(ZLibEncoder(raw: true).convert(const <int>[])));
+  if (chunks.isEmpty)
+    chunks
+        .add(Uint8List.fromList(ZLibEncoder(raw: true).convert(const <int>[])));
 
   // RA subfield: SI1 SI2 SLEN(LE) then version(2) chlen(2) chcnt(2) and
   // chcnt uint16 compressed lengths.
@@ -141,15 +145,19 @@ Uint8List buildDictZip(Uint8List data, {required int chunkLength}) {
   final extra = BytesBuilder()
     ..addByte(0x52) // 'R'
     ..addByte(0x41) // 'A'
-    ..add((ByteData(2)..setUint16(0, raDataLength, Endian.little)).buffer
+    ..add((ByteData(2)..setUint16(0, raDataLength, Endian.little))
+        .buffer
         .asUint8List())
     ..add((ByteData(2)..setUint16(0, 1, Endian.little)).buffer.asUint8List())
-    ..add((ByteData(2)..setUint16(0, chunkLength, Endian.little)).buffer
+    ..add((ByteData(2)..setUint16(0, chunkLength, Endian.little))
+        .buffer
         .asUint8List())
-    ..add((ByteData(2)..setUint16(0, chunks.length, Endian.little)).buffer
+    ..add((ByteData(2)..setUint16(0, chunks.length, Endian.little))
+        .buffer
         .asUint8List());
   for (final chunk in chunks) {
-    extra.add((ByteData(2)..setUint16(0, chunk.length, Endian.little)).buffer
+    extra.add((ByteData(2)..setUint16(0, chunk.length, Endian.little))
+        .buffer
         .asUint8List());
   }
   final extraBytes = extra.takeBytes();
@@ -158,7 +166,8 @@ Uint8List buildDictZip(Uint8List data, {required int chunkLength}) {
     ..add([0x1f, 0x8b, 8, 0x04]) // magic, deflate, FEXTRA
     ..add([0, 0, 0, 0]) // mtime
     ..add([0, 3]) // xfl, os=unix
-    ..add((ByteData(2)..setUint16(0, extraBytes.length, Endian.little)).buffer
+    ..add((ByteData(2)..setUint16(0, extraBytes.length, Endian.little))
+        .buffer
         .asUint8List())
     ..add(extraBytes);
   for (final chunk in chunks) {
@@ -166,7 +175,8 @@ Uint8List buildDictZip(Uint8List data, {required int chunkLength}) {
   }
   // Trailer: crc32 (unchecked by the reader) + ISIZE.
   out.add([0, 0, 0, 0]);
-  out.add((ByteData(4)..setUint32(0, data.length, Endian.little)).buffer
+  out.add((ByteData(4)..setUint32(0, data.length, Endian.little))
+      .buffer
       .asUint8List());
   return out.takeBytes();
 }

@@ -163,9 +163,8 @@ class DictZipReader {
       final chunk = pos ~/ _chunkLength;
       final within = pos % _chunkLength;
       final data = await _readChunk(chunk);
-      final take = data.length - within < remaining
-          ? data.length - within
-          : remaining;
+      final take =
+          data.length - within < remaining ? data.length - within : remaining;
       out.add(Uint8List.sublistView(data, within, within + take));
       pos += take;
       remaining -= take;
@@ -231,11 +230,22 @@ class StarDictReader {
 
   bool get isDictZip => _dictSource?.path.endsWith('.dz') ?? false;
 
+  bool _metadataInitialized = false;
+
+  /// Reads only the `.ifo` metadata (book name, word count, ...), without
+  /// touching the index or the entry data. Cheap; suitable for listing a
+  /// dictionary before it is fully loaded.
+  Future<void> initMetadata() async {
+    if (_metadataInitialized) return;
+    await _readIfo();
+    _metadataInitialized = true;
+  }
+
   /// Parses the `.ifo` metadata, the `.idx` word index and the optional
   /// `.syn` synonym index, and opens the `.dict` data for random access.
   Future<void> init() async {
     if (_initialized) return;
-    await _readIfo();
+    await initMetadata();
     await _readIdx();
     await _readSyn();
     final dictSource = _dictSource;
@@ -382,7 +392,8 @@ class StarDictReader {
     }
     // Synonyms are valid suggestions too: they resolve to real entries.
     for (final word in _synonymToIndex.keys) {
-      if (word.toLowerCase().startsWith(lowerQuery) && !_wordToIndex.containsKey(word)) {
+      if (word.toLowerCase().startsWith(lowerQuery) &&
+          !_wordToIndex.containsKey(word)) {
         matches.add(word);
       }
     }
