@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 /// One typed field inside a StarDict entry.
@@ -205,6 +206,11 @@ class StarDictReader {
   final List<(int, int)> _locations = []; // (offset, size) per word
   final Map<String, int> _wordToIndex = {};
   final Map<String, int> _synonymToIndex = {};
+  // Prefix-search index: display words sorted by their lowercase form
+  // (parallel lists), built once by init() so search() is a binary search
+  // plus a short scan instead of a full pass over every word per query.
+  final List<String> _searchKeys = [];
+  final List<String> _searchWords = [];
 
   /// All headwords, in index order (suitable for prefix suggestions after
   /// sorting; see [search]).
@@ -215,8 +221,6 @@ class StarDictReader {
   bool _initialized = false;
 
   File get _ifoFile => File('$path.ifo');
-  File get _idxFile => File('$path.idx');
-  File get _synFile => File('$path.syn');
 
   /// The plain `.dict` file, or the `.dict.dz` when only the compressed
   /// form exists.
@@ -243,11 +247,22 @@ class StarDictReader {
 
   /// Parses the `.ifo` metadata, the `.idx` word index and the optional
   /// `.syn` synonym index, and opens the `.dict` data for random access.
+  ///
+  /// The index parse runs in a background isolate: for dictionaries with
+  /// hundreds of thousands of words it takes long enough to stall the
+  /// caller's isolate (a UI isolate, in an app) if done inline.
   Future<void> init() async {
     if (_initialized) return;
     await initMetadata();
-    await _readIdx();
-    await _readSyn();
+    final parsed = await Isolate.run(
+      () => _parseIndexFiles(path, _idxOffsetBits),
+    );
+    _words.addAll(parsed.words);
+    _locations.addAll(parsed.locations);
+    _wordToIndex.addAll(parsed.wordToIndex);
+    _synonymToIndex.addAll(parsed.synonymToIndex);
+    _searchKeys.addAll(parsed.searchKeys);
+    _searchWords.addAll(parsed.searchWords);
     final dictSource = _dictSource;
     if (dictSource == null) {
       throw StateError('StarDict dictionary data (.dict/.dict.dz) not found '
@@ -277,50 +292,6 @@ class StarDictReader {
   }
 
   int get _idxOffsetBits => _ifo['idxoffsetbits'] == '64' ? 64 : 32;
-
-  Future<void> _readIdx() async {
-    final bytes = await _idxFile.readAsBytes();
-    final bd = ByteData.sublistView(bytes);
-    final offsetWidth = _idxOffsetBits ~/ 8;
-    var pos = 0;
-    var index = 0;
-    while (pos < bytes.length) {
-      final end = bytes.indexOf(0, pos);
-      if (end < 0) break;
-      final word = utf8.decode(Uint8List.sublistView(bytes, pos, end));
-      pos = end + 1;
-      final offset = offsetWidth == 8
-          ? bd.getUint64(pos, Endian.big)
-          : bd.getUint32(pos, Endian.big);
-      pos += offsetWidth;
-      final size = bd.getUint32(pos, Endian.big);
-      pos += 4;
-      _words.add(word);
-      _locations.add((offset, size));
-      // First occurrence wins: .idx may repeat a word for multiple entries,
-      // and lookup returns all of them via _indexRangeOf.
-      _wordToIndex.putIfAbsent(word, () => index);
-      index++;
-    }
-  }
-
-  Future<void> _readSyn() async {
-    if (!await _synFile.exists()) return;
-    final bytes = await _synFile.readAsBytes();
-    final bd = ByteData.sublistView(bytes);
-    var pos = 0;
-    while (pos < bytes.length) {
-      final end = bytes.indexOf(0, pos);
-      if (end < 0) break;
-      final word = utf8.decode(Uint8List.sublistView(bytes, pos, end));
-      pos = end + 1;
-      final target = bd.getUint32(pos, Endian.big);
-      pos += 4;
-      if (target < _words.length) {
-        _synonymToIndex.putIfAbsent(word, () => target);
-      }
-    }
-  }
 
   /// Whether [word] (or its lowercase form, or a synonym of it) has an
   /// entry in this dictionary.
@@ -379,26 +350,30 @@ class StarDictReader {
     return entries;
   }
 
-  /// Prefix search over the headwords, case-insensitive, returning at most
-  /// [limit] matches sorted alphabetically.
+  /// Prefix search over the headwords and synonyms, case-insensitive,
+  /// returning at most [limit] matches sorted alphabetically. Runs against
+  /// the pre-sorted index built by [init] instead of scanning every word.
   List<String> search(String query, {int limit = 30}) {
     if (query.isEmpty) return const [];
     final lowerQuery = query.toLowerCase();
-    final matches = <String>[];
-    for (final word in _words) {
-      if (word.toLowerCase().startsWith(lowerQuery)) {
-        matches.add(word);
+    // Binary search for the first key that could carry the prefix, then
+    // scan the matching run (bounded by limit).
+    var lo = 0;
+    var hi = _searchKeys.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (_searchKeys[mid].compareTo(lowerQuery) < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
       }
     }
-    // Synonyms are valid suggestions too: they resolve to real entries.
-    for (final word in _synonymToIndex.keys) {
-      if (word.toLowerCase().startsWith(lowerQuery) &&
-          !_wordToIndex.containsKey(word)) {
-        matches.add(word);
-      }
+    final results = <String>[];
+    for (var i = lo; i < _searchKeys.length && results.length < limit; i++) {
+      if (!_searchKeys[i].startsWith(lowerQuery)) break;
+      results.add(_searchWords[i]);
     }
-    matches.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
-    return matches.length > limit ? matches.sublist(0, limit) : matches;
+    return results;
   }
 
   Future<Uint8List> _readDict(int offset, int size) async {
@@ -455,4 +430,103 @@ class StarDictReader {
     _dictZip = null;
     _initialized = false;
   }
+}
+
+/// The parsed index of a StarDict dictionary: everything [StarDictReader]
+/// needs from the `.idx` and `.syn` files, produced by [_parseIndexFiles].
+class _ParsedIndex {
+  final List<String> words;
+  final List<(int, int)> locations;
+  final Map<String, int> wordToIndex;
+  final Map<String, int> synonymToIndex;
+  final List<String> searchKeys;
+  final List<String> searchWords;
+
+  const _ParsedIndex({
+    required this.words,
+    required this.locations,
+    required this.wordToIndex,
+    required this.synonymToIndex,
+    required this.searchKeys,
+    required this.searchWords,
+  });
+}
+
+/// Parses the `.idx` (and `.syn`, when present) files of the dictionary at
+/// [basePath]. Runs in a background isolate (see [StarDictReader.init]).
+///
+/// Words are decoded as UTF-8 with malformed sequences tolerated: legacy
+/// dictionaries occasionally carry a few words in a locale encoding, and
+/// one bad word must not make the whole dictionary unloadable — it just
+/// becomes unfindable itself.
+_ParsedIndex _parseIndexFiles(String basePath, int idxOffsetBits) {
+  final words = <String>[];
+  final locations = <(int, int)>[];
+  final wordToIndex = <String, int>{};
+  final synonymToIndex = <String, int>{};
+
+  final idxBytes = File('$basePath.idx').readAsBytesSync();
+  final idxData = ByteData.sublistView(idxBytes);
+  final offsetWidth = idxOffsetBits ~/ 8;
+  var pos = 0;
+  var index = 0;
+  while (pos < idxBytes.length) {
+    final end = idxBytes.indexOf(0, pos);
+    if (end < 0) break;
+    final word = utf8.decode(
+      Uint8List.sublistView(idxBytes, pos, end),
+      allowMalformed: true,
+    );
+    pos = end + 1;
+    final offset = offsetWidth == 8
+        ? idxData.getUint64(pos, Endian.big)
+        : idxData.getUint32(pos, Endian.big);
+    pos += offsetWidth;
+    final size = idxData.getUint32(pos, Endian.big);
+    pos += 4;
+    words.add(word);
+    locations.add((offset, size));
+    // First occurrence wins: .idx may repeat a word for multiple entries,
+    // and lookup returns all of them via the contiguous range.
+    wordToIndex.putIfAbsent(word, () => index);
+    index++;
+  }
+
+  final synFile = File('$basePath.syn');
+  if (synFile.existsSync()) {
+    final synBytes = synFile.readAsBytesSync();
+    final synData = ByteData.sublistView(synBytes);
+    var synPos = 0;
+    while (synPos < synBytes.length) {
+      final end = synBytes.indexOf(0, synPos);
+      if (end < 0) break;
+      final word = utf8.decode(
+        Uint8List.sublistView(synBytes, synPos, end),
+        allowMalformed: true,
+      );
+      synPos = end + 1;
+      final target = synData.getUint32(synPos, Endian.big);
+      synPos += 4;
+      if (target < words.length) {
+        synonymToIndex.putIfAbsent(word, () => target);
+      }
+    }
+  }
+
+  // Prefix-search index: every suggestion surface (headwords first, then
+  // synonyms that do not shadow a headword), sorted by lowercase form.
+  final pairs = <(String, String)>[
+    for (final word in wordToIndex.keys) (word.toLowerCase(), word),
+    for (final word in synonymToIndex.keys)
+      if (!wordToIndex.containsKey(word)) (word.toLowerCase(), word),
+  ]..sort((a, b) => a.$1.compareTo(b.$1));
+
+  return _ParsedIndex(
+    words: words,
+    locations: locations,
+    wordToIndex: wordToIndex,
+    synonymToIndex: synonymToIndex,
+    searchKeys: [for (final pair in pairs) pair.$1],
+    searchWords: [for (final pair in pairs) pair.$2],
+  );
 }

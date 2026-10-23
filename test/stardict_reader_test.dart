@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:dict_reader/dict_reader.dart';
 import 'package:test/test.dart';
@@ -156,5 +158,66 @@ void main() {
   test('throws a clear error when companion files are missing', () async {
     final reader = StarDictReader('${dir.path}/nonexistent');
     await expectLater(reader.init(), throwsStateError);
+  });
+
+  test('tolerates a malformed UTF-8 word in the index', () async {
+    // Hand-build a dictionary whose .idx holds one word with an invalid
+    // UTF-8 byte (0xFF) next to a valid word.
+    final base = '${dir.path}/malformed';
+    final dictBytes = BytesBuilder()
+      ..addByte(0x6d) // 'm'
+      ..add(utf8.encode('good entry'))
+      ..addByte(0)
+      ..addByte(0x6d)
+      ..add(utf8.encode('bad entry'))
+      ..addByte(0);
+    final dictData = dictBytes.takeBytes();
+    final firstEntrySize = 1 + 'good entry'.length + 1;
+
+    final idx = BytesBuilder();
+    void addIdx(List<int> wordBytes, int offset, int size) {
+      idx.add(wordBytes);
+      idx.addByte(0);
+      idx.add(
+        (ByteData(4)..setUint32(0, offset, Endian.big)).buffer.asUint8List(),
+      );
+      idx.add(
+        (ByteData(4)..setUint32(0, size, Endian.big)).buffer.asUint8List(),
+      );
+    }
+
+    addIdx(utf8.encode('good'), 0, firstEntrySize);
+    addIdx(
+        [0x62, 0xFF, 0x64], firstEntrySize, dictData.length - firstEntrySize);
+
+    await File('$base.dict').writeAsBytes(dictData);
+    await File('$base.idx').writeAsBytes(idx.takeBytes());
+    await File('$base.ifo').writeAsString(
+      "StarDict's dict ifo file\n"
+      'version=2.4.2\n'
+      'bookname=Malformed\n'
+      'wordcount=2\n',
+    );
+
+    final reader = StarDictReader(base);
+    await reader.init();
+    expect(reader.words, hasLength(2));
+    final entries = await reader.lookup('good');
+    expect(entries.single.fields.single.text, 'good entry');
+    await reader.close();
+  });
+
+  test('search does not repeat words that have several entries', () async {
+    final builder = StarDictFixtureBuilder()
+      ..add('echo', [('m', 'first')])
+      ..add('echo', [('m', 'second')])
+      ..add('eclipse', [('m', 'x')]);
+    final base = await builder.write(dir, 'dupes');
+    final reader = StarDictReader(base);
+    await reader.init();
+
+    expect(await reader.lookup('echo'), hasLength(2));
+    expect(reader.search('ec'), ['echo', 'eclipse']);
+    await reader.close();
   });
 }

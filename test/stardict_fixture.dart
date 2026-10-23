@@ -135,9 +135,11 @@ Uint8List buildDictZip(Uint8List data, {required int chunkLength}) {
       ),
     );
   }
-  if (chunks.isEmpty)
-    chunks
-        .add(Uint8List.fromList(ZLibEncoder(raw: true).convert(const <int>[])));
+  if (chunks.isEmpty) {
+    chunks.add(
+      Uint8List.fromList(ZLibEncoder(raw: true).convert(const <int>[])),
+    );
+  }
 
   // RA subfield: SI1 SI2 SLEN(LE) then version(2) chlen(2) chcnt(2) and
   // chcnt uint16 compressed lengths.
