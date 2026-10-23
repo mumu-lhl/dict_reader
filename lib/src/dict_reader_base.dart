@@ -159,7 +159,12 @@ class DictReader {
 
       if (readKeys) {
         _keyList = initData.keyList!;
-        _rebuildLookupKeyList();
+        final lookupKeyIndices = initData.lookupKeyIndices;
+        if (lookupKeyIndices != null) {
+          _lookupKeyIndices = lookupKeyIndices;
+        } else {
+          _rebuildLookupKeyList();
+        }
       }
       numEntries = initData.numEntries!;
       _recordBlockOffset = initData.recordBlockOffset!;
@@ -269,7 +274,14 @@ class DictReader {
     final importedData =
         await Isolate.run(() => _importCacheIsolate(cacheData));
     _keyList = importedData['keyList'] as List<(int, String)>;
-    _rebuildLookupKeyList();
+    // The import isolate already sorted the lookup index; only caches
+    // produced by older versions need a local rebuild.
+    final lookupKeyIndices = importedData['lookupKeyIndices'] as List<int>?;
+    if (lookupKeyIndices != null) {
+      _lookupKeyIndices = lookupKeyIndices;
+    } else {
+      _rebuildLookupKeyList();
+    }
     numEntries = importedData['numEntries'];
     _recordBlockOffset = importedData['recordBlockOffset'];
     _recordBlockInfoList =
@@ -624,13 +636,7 @@ class DictReader {
   }
 
   void _rebuildLookupKeyList() {
-    final lookupKeyIndices =
-        List<int>.generate(_keyList.length, (index) => index);
-    lookupKeyIndices.sort((a, b) {
-      final keyComparison = _keyList[a].$2.compareTo(_keyList[b].$2);
-      return keyComparison != 0 ? keyComparison : a.compareTo(b);
-    });
-    _lookupKeyIndices = lookupKeyIndices;
+    _lookupKeyIndices = _buildLookupKeyIndices(_keyList);
   }
 
   void _buildRecordBlockIndex() {
@@ -1425,6 +1431,7 @@ class _DictInitData {
 
   // For _readKeys
   List<(int, String)>? keyList;
+  List<int>? lookupKeyIndices;
   int? numEntries;
 
   // For _readRecordBlockInfo
@@ -1434,10 +1441,24 @@ class _DictInitData {
   _DictInitData();
 }
 
+/// Builds the lookup index: positions into [keyList] sorted by key (ties
+/// keep the original order). This is an O(n log n) sort over every
+/// headword, so it runs inside whichever isolate already holds the key
+/// list (key scan / cache import) instead of on the caller's isolate.
+List<int> _buildLookupKeyIndices(List<(int, String)> keyList) {
+  final lookupKeyIndices = List<int>.generate(keyList.length, (index) => index);
+  lookupKeyIndices.sort((a, b) {
+    final keyComparison = keyList[a].$2.compareTo(keyList[b].$2);
+    return keyComparison != 0 ? keyComparison : a.compareTo(b);
+  });
+  return lookupKeyIndices;
+}
+
 Map<String, dynamic> _importCacheIsolate(Map<String, dynamic> cacheData) {
   final keyList = (cacheData['keyList'] as List)
       .map((e) => (e[0] as int, e[1] as String))
       .toList();
+  final lookupKeyIndices = _buildLookupKeyIndices(keyList);
   final numEntries = cacheData['numEntries'];
   final recordBlockOffset = cacheData['recordBlockOffset'];
   List<(int, int)>? recordBlockInfoList;
@@ -1450,6 +1471,7 @@ Map<String, dynamic> _importCacheIsolate(Map<String, dynamic> cacheData) {
 
   return {
     'keyList': keyList,
+    'lookupKeyIndices': lookupKeyIndices,
     'numEntries': numEntries,
     'recordBlockOffset': recordBlockOffset,
     'recordBlockInfoList': recordBlockInfoList,
@@ -1503,6 +1525,9 @@ Future<_DictInitData> _initDictIsolate(
 
   if (readKeys) {
     initData.keyList = await reader._readKeys();
+    // Sort the lookup index here, in the isolate that already holds the
+    // key list, instead of on the caller's isolate after the transfer.
+    initData.lookupKeyIndices = _buildLookupKeyIndices(initData.keyList!);
     initData.numEntries = reader.numEntries;
     initData.recordBlockOffset = reader._recordBlockOffset;
   } else if (readRecordBlockInfo) {
