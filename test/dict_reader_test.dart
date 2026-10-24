@@ -360,62 +360,178 @@ void main() {
     expect(keys, ['alpha', r'$beta', 'gamma']);
   });
 
-  test('imports cache into a fresh reader', () async {
+  test('imports a cidx index into a fresh reader', () async {
     final directory =
-        await Directory.systemTemp.createTemp('dict_reader_cache_test_');
+        await Directory.systemTemp.createTemp('dict_reader_cidx_test_');
     addTearDown(() => directory.delete(recursive: true));
-    final file = await _createFixture(directory);
+    final file = await _createFixture(directory, entries: const [
+      ('alpha', 'A'),
+      (r'$beta', 'B'),
+      ('gamma', 'C'),
+    ]);
 
     final source = DictReader(file.path);
     await source.initDict();
-    final cache = await source.exportCache();
+    final cidx = await source.exportCidx();
     await source.close();
 
     final reader = DictReader(file.path);
-    await reader.importCache(cache);
+    await reader.importCidx(cidx);
     addTearDown(reader.close);
 
     final offset = await reader.locate('alpha');
     expect(offset, isNotNull);
     expect(await reader.readOneMdx(offset!), 'A');
+    expect(reader.exist('gamma'), isTrue);
+    expect(reader.exist('missing'), isFalse);
+    expect(reader.search('a'), ['alpha']);
+    expect(reader.search(''), [r'$beta', 'alpha', 'gamma']);
   });
 
-  test('rejects cache with an unsupported version', () async {
-    final directory = await Directory.systemTemp
-        .createTemp('dict_reader_cache_version_test_');
+  test('cidx round-trip matches the scanned reader', () async {
+    final directory =
+        await Directory.systemTemp.createTemp('dict_reader_cidx_parity_');
+    addTearDown(() => directory.delete(recursive: true));
+    // Duplicate headwords, unsorted file order, and a non-ASCII key.
+    final file = await _createFixture(directory, entries: const [
+      ('banana', 'B1'),
+      ('Apple', 'A1'),
+      ('banana', 'B2'),
+      ('äpfel', 'Ä'),
+      ('apple', 'a2'),
+    ]);
+
+    final scanned = DictReader(file.path);
+    await scanned.initDict();
+    addTearDown(scanned.close);
+    final cidx = await scanned.exportCidx();
+
+    final imported = DictReader(file.path);
+    await imported.importCidx(cidx);
+    addTearDown(imported.close);
+
+    for (final word in ['banana', 'Apple', 'apple', 'äpfel', 'missing']) {
+      expect(imported.exist(word), scanned.exist(word), reason: word);
+      final scannedOffsets = await scanned.locateAll(word);
+      final importedOffsets = await imported.locateAll(word);
+      expect(importedOffsets.length, scannedOffsets.length, reason: word);
+      for (var i = 0; i < scannedOffsets.length; i++) {
+        expect(
+          await imported.readOneMdx(importedOffsets[i]),
+          await scanned.readOneMdx(scannedOffsets[i]),
+          reason: '$word#$i',
+        );
+      }
+    }
+    for (final prefix in ['a', 'ap', 'b', 'ban', 'ä', '']) {
+      expect(
+        imported.search(prefix).toSet(),
+        scanned.search(prefix).toSet(),
+        reason: 'prefix $prefix',
+      );
+    }
+    // The file-order streaming API still works after a cidx import,
+    // via the lazily built file-order key list.
+    final streamed = <(String, String)>[];
+    await for (final record in imported.readWithMdxData()) {
+      streamed.add((record.keyText, record.data));
+    }
+    expect(streamed, [
+      ('banana', 'B1'),
+      ('Apple', 'A1'),
+      ('banana', 'B2'),
+      ('äpfel', 'Ä'),
+      ('apple', 'a2'),
+    ]);
+  });
+
+  test('cidx import tolerates a malformed headword', () async {
+    final directory =
+        await Directory.systemTemp.createTemp('dict_reader_cidx_badkey_');
+    addTearDown(() => directory.delete(recursive: true));
+    // A raw 0xFF byte is not valid UTF-8: the tolerant decoder drops it,
+    // and the cleaned key is what the index stores.
+    final file = await _createFixture(
+      directory,
+      entries: const [('good', 'G'), ('bad', 'B')],
+      keyBytesOverride: [
+        utf8.encode('good'),
+        [0x62, 0x61, 0xff, 0x64],
+      ],
+    );
+
+    final scanned = DictReader(file.path);
+    await scanned.initDict();
+    addTearDown(scanned.close);
+    final cidx = await scanned.exportCidx();
+
+    final imported = DictReader(file.path);
+    await imported.importCidx(cidx);
+    addTearDown(imported.close);
+
+    expect(imported.exist('good'), isTrue);
+    expect(imported.exist('bad'), isTrue);
+    final offset = await imported.locate('bad');
+    expect(offset, isNotNull);
+    expect(await imported.readOneMdx(offset!), 'B');
+  });
+
+  test('rejects a cidx with an unsupported version', () async {
+    final directory =
+        await Directory.systemTemp.createTemp('dict_reader_cidx_version_');
     addTearDown(() => directory.delete(recursive: true));
     final file = await _createFixture(directory);
 
     final source = DictReader(file.path);
     await source.initDict();
-    final cache = await source.exportCache();
+    final cidx = await source.exportCidx();
     await source.close();
-    cache['cacheVersion'] = 999;
+    // Version field: bytes 4..8, big-endian.
+    cidx[7] = 99;
 
     final reader = DictReader(file.path);
     addTearDown(reader.close);
     await expectLater(
-      () async => reader.importCache(cache),
+      () async => reader.importCidx(cidx),
       throwsA(isA<FormatException>()),
     );
   });
 
-  test('rejects cache for a different dictionary file', () async {
-    final directory = await Directory.systemTemp
-        .createTemp('dict_reader_cache_identity_test_');
+  test('rejects a cidx for a changed dictionary file', () async {
+    final directory =
+        await Directory.systemTemp.createTemp('dict_reader_cidx_changed_');
     addTearDown(() => directory.delete(recursive: true));
     final file = await _createFixture(directory);
 
     final source = DictReader(file.path);
     await source.initDict();
-    final cache = await source.exportCache();
+    final cidx = await source.exportCidx();
     await source.close();
-    cache['fileSize'] = 0;
+    await file.writeAsBytes([0], mode: FileMode.append);
 
     final reader = DictReader(file.path);
     addTearDown(reader.close);
     await expectLater(
-      () async => reader.importCache(cache),
+      () async => reader.importCidx(cidx),
+      throwsA(isA<FormatException>()),
+    );
+  });
+
+  test('rejects a truncated cidx', () async {
+    final directory =
+        await Directory.systemTemp.createTemp('dict_reader_cidx_trunc_');
+    addTearDown(() => directory.delete(recursive: true));
+    final file = await _createFixture(directory);
+
+    final source = DictReader(file.path);
+    await source.initDict();
+    final cidx = await source.exportCidx();
+    await source.close();
+
+    final reader = DictReader(file.path);
+    addTearDown(reader.close);
+    await expectLater(
+      () async => reader.importCidx(cidx.sublist(0, cidx.length - 3)),
       throwsA(isA<FormatException>()),
     );
   });

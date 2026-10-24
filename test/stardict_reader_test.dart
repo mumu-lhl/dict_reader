@@ -37,7 +37,8 @@ void main() {
     expect(reader.bookName, 'Test Dictionary');
     expect(reader.wordCount, 3);
     expect(reader.sameTypeSequence, isNull);
-    expect(reader.words, ['apple', 'banana', 'Cherry']);
+    // Words are reported in sorted index order, not insertion order.
+    expect(reader.words, ['Cherry', 'apple', 'banana']);
 
     final entries = await reader.lookup('apple');
     expect(entries, hasLength(1));
