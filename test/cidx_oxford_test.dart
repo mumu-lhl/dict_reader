@@ -19,7 +19,11 @@ void main() {
       orElse: () => '',
     );
     if (path.isEmpty) {
+      // markTestSkipped does not stop the test body: without this return
+      // the code below would run DictReader('') and throw on CI, where
+      // neither Oxford path exists.
       markTestSkipped('Oxford MDX not available on this machine');
+      return;
     }
 
     final scanned = DictReader(path);
