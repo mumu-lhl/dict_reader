@@ -7,7 +7,8 @@ import "package:blockchain_utils/crypto/crypto/hash/hash.dart";
 import "package:charset/charset.dart";
 import "package:html_unescape/html_unescape.dart";
 
-const _cacheVersion = 2;
+import "cidx.dart";
+
 const _utf16Decoder = Utf16Decoder();
 
 Uint8List _fastDecrypt(Uint8List data, Uint8List key) {
@@ -83,6 +84,15 @@ class DictReader {
   File? _dict;
   late List<(int, String)> _keyList;
   late List<int> _lookupKeyIndices;
+  bool _keyListReady = false;
+
+  /// On-disk index state after [importCidx]: the entry body and offset
+  /// table. While this is set, [locate]/[search]/[exist] binary-search
+  /// the bytes directly and never materialize the 205k headword strings;
+  /// only the file-order streaming API builds [_keyList] on demand.
+  bool _cidxLoaded = false;
+  Uint8List? _cidxBody;
+  List<int>? _cidxEntryOffsets;
   late int _encrypt;
   RandomAccessFile? _f;
   List<(int, int)>? _recordBlockInfoList;
@@ -116,6 +126,7 @@ class DictReader {
     _headerLoaded = true;
     if (readKey) {
       _keyList = await _readKeys();
+      _keyListReady = true;
       _rebuildLookupKeyList();
       await _readRecordBlockInfo();
     }
@@ -159,6 +170,7 @@ class DictReader {
 
       if (readKeys) {
         _keyList = initData.keyList!;
+        _keyListReady = true;
         final lookupKeyIndices = initData.lookupKeyIndices;
         if (lookupKeyIndices != null) {
           _lookupKeyIndices = lookupKeyIndices;
@@ -188,6 +200,10 @@ class DictReader {
     await file?.close();
     _dict = null;
     _headerLoaded = false;
+    _keyListReady = false;
+    _cidxLoaded = false;
+    _cidxBody = null;
+    _cidxEntryOffsets = null;
     _recordBlockInfoList = null;
     _totalDecompressedSize = null;
     _recordBlockDecompressedStarts = null;
@@ -196,72 +212,64 @@ class DictReader {
     _recordBlockCacheSize = 0;
   }
 
-  /// Exports the cache data as a map.
+  /// Exports the on-disk index (`.cidx`) for this dictionary.
   ///
-  /// This method extracts the key list, number of entries, record block offset,
-  /// record block info list, and total decompressed size into a map, which can
-  /// be used for caching. This operation is performed in an isolate.
-  Future<Map<String, dynamic>> exportCache() async {
+  /// The caller writes the returned bytes next to the dictionary's cache
+  /// file; [importCidx] reads them back. The byte-level sort runs in an
+  /// isolate, off the caller's isolate. Requires a completed scan
+  /// ([initDict] with keys), since the index is built from it.
+  Future<Uint8List> exportCidx() async {
+    if (!_keyListReady) {
+      throw StateError('Dictionary keys have not been scanned yet');
+    }
+    final totalDecompressedSize = _totalDecompressedSize;
+    if (totalDecompressedSize == null) {
+      throw StateError('Dictionary record blocks have not been scanned yet');
+    }
     final file = File(_path);
     final stat = await file.stat();
     final filePath = await file.resolveSymbolicLinks();
     final keyList = _keyList;
-    final numEntries = this.numEntries;
-    final recordBlockOffset = _recordBlockOffset;
     final recordBlockInfoList = _recordBlockInfoList;
-    final totalDecompressedSize = _totalDecompressedSize;
-    return Isolate.run(() => _exportCacheIsolate(
-          keyList,
-          numEntries,
-          recordBlockOffset,
-          recordBlockInfoList,
-          totalDecompressedSize,
-          filePath,
-          stat.size,
-          stat.modified.microsecondsSinceEpoch,
+    final recordBlockOffset = _recordBlockOffset;
+    final numberWidth = _numberWidth;
+    return Isolate.run(() => buildCidx(
+          keyList: keyList,
+          recordBlockInfoList: recordBlockInfoList,
+          recordBlockOffset: recordBlockOffset,
+          numberWidth: numberWidth,
+          totalDecompressedSize: totalDecompressedSize,
+          filePath: filePath,
+          fileSize: stat.size,
+          fileModified: stat.modified.microsecondsSinceEpoch,
         ));
   }
 
-  /// Exports the cache data as a JSON string.
+  /// Imports a `.cidx` index produced by [exportCidx].
   ///
-  /// This is a convenience method that calls [exportCache] and returns the
-  /// result as a JSON-encoded string. This operation is performed in an isolate.
-  Future<String> exportCacheAsString() async {
-    final cacheMap = await exportCache();
-    return Isolate.run(() => jsonEncode(cacheMap));
-  }
-
-  /// Imports cache data from a map.
-  ///
-  /// This method populates the dictionary's fields from a cache map, avoiding
-  /// the need to re-read and process the dictionary file. This operation is
-  /// performed in an isolate.
-  Future<void> _validateCache(Map<String, dynamic> cacheData) async {
-    if (cacheData['cacheVersion'] != _cacheVersion) {
-      throw const FormatException("Unsupported dictionary cache version");
-    }
-
-    final cachedPath = cacheData['filePath'];
-    if (cachedPath is! String) {
-      throw const FormatException("Dictionary cache has no file identity");
-    }
+  /// The header is validated against this dictionary file (path, size,
+  /// mtime — the same rules the old JSON cache used); a mismatch throws
+  /// [FormatException] and the caller falls back to a full scan. After a
+  /// successful import, [locate]/[search]/[exist] binary-search the
+  /// index bytes directly, without materializing the headword strings.
+  /// The file-order streaming API still works: it builds the file-order
+  /// key list from the index lazily, on first use.
+  Future<void> importCidx(Uint8List bytes) async {
+    final data = parseCidx(bytes);
+    final cidxHeader = data.header;
 
     final file = File(_path);
     final actualPath = await file.resolveSymbolicLinks();
-    if (cachedPath != actualPath) {
-      throw const FormatException("Dictionary cache belongs to another file");
+    if (cidxHeader.filePath != actualPath) {
+      throw const FormatException("Dictionary index belongs to another file");
     }
-
     final stat = await file.stat();
-    if (cacheData['fileSize'] != stat.size ||
-        cacheData['fileModified'] != stat.modified.microsecondsSinceEpoch) {
+    if (cidxHeader.fileSize != stat.size ||
+        cidxHeader.fileModified != stat.modified.microsecondsSinceEpoch) {
       throw const FormatException(
-          "Dictionary file has changed since cache export");
+          "Dictionary file has changed since index export");
     }
-  }
 
-  Future<void> importCache(Map<String, dynamic> cacheData) async {
-    await _validateCache(cacheData);
     if (_f == null) {
       _dict = File(_path);
       _f = await _dict!.open();
@@ -271,32 +279,15 @@ class DictReader {
       _headerLoaded = true;
     }
 
-    final importedData =
-        await Isolate.run(() => _importCacheIsolate(cacheData));
-    _keyList = importedData['keyList'] as List<(int, String)>;
-    // The import isolate already sorted the lookup index; only caches
-    // produced by older versions need a local rebuild.
-    final lookupKeyIndices = importedData['lookupKeyIndices'] as List<int>?;
-    if (lookupKeyIndices != null) {
-      _lookupKeyIndices = lookupKeyIndices;
-    } else {
-      _rebuildLookupKeyList();
-    }
-    numEntries = importedData['numEntries'];
-    _recordBlockOffset = importedData['recordBlockOffset'];
-    _recordBlockInfoList =
-        importedData['recordBlockInfoList'] as List<(int, int)>?;
-    _totalDecompressedSize = importedData['totalDecompressedSize'];
+    numEntries = cidxHeader.entryCount;
+    _recordBlockOffset = cidxHeader.recordBlockOffset;
+    _numberWidth = cidxHeader.numberWidth;
+    _recordBlockInfoList = cidxHeader.recordBlockInfoList;
+    _totalDecompressedSize = cidxHeader.totalDecompressedSize;
     _buildRecordBlockIndex();
-  }
-
-  /// Imports cache data from a JSON string.
-  ///
-  /// This is a convenience method that decodes a JSON string and calls
-  /// [importCache] with the resulting map.
-  Future<void> importCacheFromString(String cacheString) async {
-    final cacheData = await Isolate.run(() => jsonDecode(cacheString));
-    await importCache(cacheData);
+    _cidxBody = data.body;
+    _cidxEntryOffsets = data.entryOffsets;
+    _cidxLoaded = true;
   }
 
   /// Sets a callback function to be called after the header is read.
@@ -539,6 +530,16 @@ class DictReader {
   /// This method can be used to get the content of a key after initialization.
   /// Returns `null` if the key is not found.
   Future<RecordOffsetInfo?> locate(String key) async {
+    if (_cidxLoaded) {
+      final query = _encodeQuery(key);
+      if (query == null) return null;
+      final index = _cidxLowerBound(query);
+      if (index >= _cidxEntryOffsets!.length) return null;
+      if (!_cidxKeyEquals(index, query)) return null;
+      final (_, _, recordStart, recordEnd) = _cidxEntry(index);
+      return _buildRecordOffsetInfo(key, recordStart, recordEnd);
+    }
+
     final keyIndex = _lookupBinarySearch(key);
 
     if (keyIndex < 0) {
@@ -558,6 +559,23 @@ class DictReader {
   /// This method can be used to get the content of a key after initialization.
   /// Returns an empty list if the key is not found.
   Future<List<RecordOffsetInfo>> locateAll(String key) async {
+    if (_cidxLoaded) {
+      final results = <RecordOffsetInfo>[];
+      final query = _encodeQuery(key);
+      if (query == null) return results;
+      var index = _cidxLowerBound(query);
+      while (
+          index < _cidxEntryOffsets!.length && _cidxKeyEquals(index, query)) {
+        final (_, _, recordStart, recordEnd) = _cidxEntry(index);
+        final offsetInfo = _buildRecordOffsetInfo(key, recordStart, recordEnd);
+        if (offsetInfo != null) {
+          results.add(offsetInfo);
+        }
+        index++;
+      }
+      return results;
+    }
+
     final results = <RecordOffsetInfo>[];
     // Use lowerBound to find the first potential match.
     var keyIndex = _lookupLowerBound(key);
@@ -589,6 +607,23 @@ class DictReader {
   /// This method can be used to get the content of a key after initialization.
   /// Returns an empty list if the key is not found.
   List<String> search(String key, {int? limit}) {
+    if (_cidxLoaded) {
+      final query = _encodeQuery(key);
+      if (query == null) return const [];
+      final results = <String>[];
+      var index = _cidxLowerBound(query);
+      while (index < _cidxEntryOffsets!.length) {
+        if (limit != null && results.length >= limit) break;
+        final (keyOffset, keyLength, _, _) = _cidxEntry(index);
+        if (!startsWithBytes(_cidxBody!, keyOffset, keyLength, query)) break;
+        results.add(utf8.decode(
+          Uint8List.sublistView(_cidxBody!, keyOffset, keyOffset + keyLength),
+        ));
+        index++;
+      }
+      return results;
+    }
+
     // Use lowerBound to find the first potential match.
     final firstMatchIndex = _lookupLowerBound(key);
 
@@ -599,7 +634,86 @@ class DictReader {
   ///
   /// Returns `true` if the key is found, otherwise `false`.
   bool exist(String key) {
+    if (_cidxLoaded) {
+      final query = _encodeQuery(key);
+      if (query == null) return false;
+      final index = _cidxLowerBound(query);
+      return index < _cidxEntryOffsets!.length && _cidxKeyEquals(index, query);
+    }
     return _lookupBinarySearch(key) >= 0;
+  }
+
+  /// Encodes a lookup query to the index's byte form, or null when the
+  /// query cannot be represented (unpaired surrogates).
+  static List<int>? _encodeQuery(String key) {
+    try {
+      return utf8.encode(key);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// (keyOffset, keyLength, recordStart, recordEnd) of the [sortedIndex]-th
+  /// entry in the loaded `.cidx` body.
+  (int, int, int, int) _cidxEntry(int sortedIndex) {
+    final body = _cidxBody!;
+    final entryStart = _cidxEntryOffsets![sortedIndex];
+    final keyLength =
+        ByteData.sublistView(body).getUint32(entryStart, Endian.big);
+    final keyOffset = entryStart + 4;
+    final recordStart =
+        ByteData.sublistView(body).getUint64(keyOffset + keyLength, Endian.big);
+    final recordEnd = ByteData.sublistView(body)
+        .getUint64(keyOffset + keyLength + 8, Endian.big);
+    return (keyOffset, keyLength, recordStart, recordEnd);
+  }
+
+  bool _cidxKeyEquals(int sortedIndex, List<int> query) {
+    final (keyOffset, keyLength, _, _) = _cidxEntry(sortedIndex);
+    return keyLength == query.length &&
+        compareBytes(_cidxBody!, keyOffset, keyLength, query) == 0;
+  }
+
+  /// First entry whose key is >= [query] in UTF-8 byte order.
+  int _cidxLowerBound(List<int> query) {
+    final offsets = _cidxEntryOffsets!;
+    var lo = 0;
+    var hi = offsets.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      final (keyOffset, keyLength, _, _) = _cidxEntry(mid);
+      if (compareBytes(_cidxBody!, keyOffset, keyLength, query) < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  /// Builds the file-order key list from the loaded `.cidx` body, for the
+  /// file-order streaming API only. The hot lookup path never calls this:
+  /// it keeps working on the bytes. A no-op when the scan already built
+  /// the list.
+  void _ensureFileOrderKeyList() {
+    if (_keyListReady) return;
+    if (!_cidxLoaded) {
+      throw StateError('Dictionary keys have not been loaded');
+    }
+    final entries = <(int, String)>[];
+    for (var i = 0; i < _cidxEntryOffsets!.length; i++) {
+      final (keyOffset, keyLength, recordStart, _) = _cidxEntry(i);
+      entries.add((
+        recordStart,
+        utf8.decode(
+          Uint8List.sublistView(_cidxBody!, keyOffset, keyOffset + keyLength),
+        ),
+      ));
+    }
+    // Dart's sort is stable, so equal record starts keep index order.
+    entries.sort((a, b) => a.$1.compareTo(b.$1));
+    _keyList = entries;
+    _keyListReady = true;
   }
 
   int _lookupBinarySearch(String key) {
@@ -1191,6 +1305,9 @@ class DictReader {
               List<(int, int, int, int)> segments)
           recordProcessor,
       {bool readData = true}) async* {
+    // File-order traversal needs the file-order key list; after a
+    // `.cidx` import it is built lazily here, once.
+    _ensureFileOrderKeyList();
     await f.setPosition(_recordBlockOffset);
 
     final recordBlockInfoList = await _readRecordBlockInfoFromHandle(f);
@@ -1444,7 +1561,7 @@ class _DictInitData {
 /// Builds the lookup index: positions into [keyList] sorted by key (ties
 /// keep the original order). This is an O(n log n) sort over every
 /// headword, so it runs inside whichever isolate already holds the key
-/// list (key scan / cache import) instead of on the caller's isolate.
+/// list (key scan) instead of on the caller's isolate.
 List<int> _buildLookupKeyIndices(List<(int, String)> keyList) {
   final lookupKeyIndices = List<int>.generate(keyList.length, (index) => index);
   lookupKeyIndices.sort((a, b) {
@@ -1452,54 +1569,6 @@ List<int> _buildLookupKeyIndices(List<(int, String)> keyList) {
     return keyComparison != 0 ? keyComparison : a.compareTo(b);
   });
   return lookupKeyIndices;
-}
-
-Map<String, dynamic> _importCacheIsolate(Map<String, dynamic> cacheData) {
-  final keyList = (cacheData['keyList'] as List)
-      .map((e) => (e[0] as int, e[1] as String))
-      .toList();
-  final lookupKeyIndices = _buildLookupKeyIndices(keyList);
-  final numEntries = cacheData['numEntries'];
-  final recordBlockOffset = cacheData['recordBlockOffset'];
-  List<(int, int)>? recordBlockInfoList;
-  if (cacheData['recordBlockInfoList'] != null) {
-    recordBlockInfoList = (cacheData['recordBlockInfoList'] as List)
-        .map((e) => (e[0] as int, e[1] as int))
-        .toList();
-  }
-  final totalDecompressedSize = cacheData['totalDecompressedSize'];
-
-  return {
-    'keyList': keyList,
-    'lookupKeyIndices': lookupKeyIndices,
-    'numEntries': numEntries,
-    'recordBlockOffset': recordBlockOffset,
-    'recordBlockInfoList': recordBlockInfoList,
-    'totalDecompressedSize': totalDecompressedSize,
-  };
-}
-
-Map<String, dynamic> _exportCacheIsolate(
-    List<(int, String)> keyList,
-    int numEntries,
-    int recordBlockOffset,
-    List<(int, int)>? recordBlockInfoList,
-    int? totalDecompressedSize,
-    String filePath,
-    int fileSize,
-    int fileModified) {
-  return {
-    'cacheVersion': _cacheVersion,
-    'filePath': filePath,
-    'fileSize': fileSize,
-    'fileModified': fileModified,
-    'keyList': keyList.map((e) => [e.$1, e.$2]).toList(),
-    'numEntries': numEntries,
-    'recordBlockOffset': recordBlockOffset,
-    'recordBlockInfoList':
-        recordBlockInfoList?.map((e) => [e.$1, e.$2]).toList(),
-    'totalDecompressedSize': totalDecompressedSize,
-  };
 }
 
 Future<_DictInitData> _initDictIsolate(
