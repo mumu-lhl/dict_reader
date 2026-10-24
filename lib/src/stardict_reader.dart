@@ -3,6 +3,8 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'cidx.dart';
+
 /// One typed field inside a StarDict entry.
 ///
 /// The [type] is the single-character type code from the dictionary's
@@ -199,22 +201,44 @@ class StarDictReader {
   String get bookName => _ifo['bookname'] ?? '';
   String get version => _ifo['version'] ?? '';
   String? get sameTypeSequence => _ifo['sametypesequence'];
-  int get wordCount => int.tryParse(_ifo['wordcount'] ?? '') ?? _words.length;
+  int get wordCount =>
+      int.tryParse(_ifo['wordcount'] ?? '') ?? _idxEntryOffsets.length;
 
-  // Index structures, built by init().
-  final List<String> _words = [];
-  final List<(int, int)> _locations = []; // (offset, size) per word
-  final Map<String, int> _wordToIndex = {};
-  final Map<String, int> _synonymToIndex = {};
-  // Prefix-search index: display words sorted by their lowercase form
-  // (parallel lists), built once by init() so search() is a binary search
-  // plus a short scan instead of a full pass over every word per query.
-  final List<String> _searchKeys = [];
-  final List<String> _searchWords = [];
+  // On-disk index state, built by init(). The `.idx` (and `.syn`) files
+  // are themselves sorted indexes, so they are read whole into memory
+  // and binary-searched in place: no headword strings, locations, or
+  // lookup maps are materialized. Only entry start offsets are kept
+  // (one int per entry), plus the prefix-search order below.
+  Uint8List? _idxBytes;
+  List<int> _idxEntryOffsets = [];
+  // File-order `.idx` position -> sorted position. `.syn` targets are
+  // file-order positions, so synonym resolution goes through this map.
+  List<int> _idxFileToSorted = [];
+  int _idxOffsetWidth = 4;
+  Uint8List? _synBytes;
+  List<int> _synEntryOffsets = [];
+  // Prefix-search order: entry codes sorted by lowercase display word.
+  // A code >= 0 is an `.idx` entry index; a code < 0 encodes a `.syn`
+  // entry index as -(index + 1). The display word itself is decoded
+  // from the index bytes on demand, so search() costs one decode per
+  // binary-search probe plus one per returned match.
+  List<int> _searchOrder = [];
+  List<String>? _wordsCache;
 
-  /// All headwords, in index order (suitable for prefix suggestions after
-  /// sorting; see [search]).
-  List<String> get words => List.unmodifiable(_words);
+  /// All headwords, in sorted index order. Decoded lazily on first
+  /// access and cached; prefer [wordAt] for single lookups so a large
+  /// dictionary is not decoded in full.
+  List<String> get words {
+    var cache = _wordsCache;
+    if (cache == null) {
+      cache = [for (var i = 0; i < _idxEntryOffsets.length; i++) _idxWordAt(i)];
+      _wordsCache = cache;
+    }
+    return List.unmodifiable(cache);
+  }
+
+  /// The headword of the [index]-th `.idx` entry, decoded on demand.
+  String wordAt(int index) => _idxWordAt(index);
 
   RandomAccessFile? _dictFile;
   DictZipReader? _dictZip;
@@ -255,14 +279,15 @@ class StarDictReader {
     if (_initialized) return;
     await initMetadata();
     final parsed = await Isolate.run(
-      () => _parseIndexFiles(path, _idxOffsetBits),
+      () => _parseStarDictIndex(path, _idxOffsetBits),
     );
-    _words.addAll(parsed.words);
-    _locations.addAll(parsed.locations);
-    _wordToIndex.addAll(parsed.wordToIndex);
-    _synonymToIndex.addAll(parsed.synonymToIndex);
-    _searchKeys.addAll(parsed.searchKeys);
-    _searchWords.addAll(parsed.searchWords);
+    _idxBytes = parsed.idxBytes;
+    _idxEntryOffsets = parsed.idxEntryOffsets;
+    _idxFileToSorted = parsed.idxFileToSorted;
+    _idxOffsetWidth = parsed.idxOffsetWidth;
+    _synBytes = parsed.synBytes;
+    _synEntryOffsets = parsed.synEntryOffsets;
+    _searchOrder = parsed.searchOrder;
     final dictSource = _dictSource;
     if (dictSource == null) {
       throw StateError('StarDict dictionary data (.dict/.dict.dz) not found '
@@ -293,6 +318,92 @@ class StarDictReader {
 
   int get _idxOffsetBits => _ifo['idxoffsetbits'] == '64' ? 64 : 32;
 
+  String _idxWordAt(int entryIndex) {
+    final start = _idxEntryOffsets[entryIndex];
+    final end = _idxBytes!.indexOf(0, start);
+    return utf8.decode(
+      Uint8List.sublistView(_idxBytes!, start, end),
+      allowMalformed: true,
+    );
+  }
+
+  (int, int) _idxLocationAt(int entryIndex) {
+    final start = _idxEntryOffsets[entryIndex];
+    final end = _idxBytes!.indexOf(0, start);
+    final data = ByteData.sublistView(_idxBytes!);
+    var pos = end + 1;
+    final offset = _idxOffsetWidth == 8
+        ? data.getUint64(pos, Endian.big)
+        : data.getUint32(pos, Endian.big);
+    pos += _idxOffsetWidth;
+    final size = data.getUint32(pos, Endian.big);
+    return (offset, size);
+  }
+
+  /// First `.idx` entry whose word bytes are >= [queryBytes].
+  int _idxLowerBound(List<int> queryBytes) {
+    var lo = 0;
+    var hi = _idxEntryOffsets.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      final start = _idxEntryOffsets[mid];
+      final end = _idxBytes!.indexOf(0, start);
+      if (compareBytes(_idxBytes!, start, end - start, queryBytes) < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  bool _idxKeyEquals(int entryIndex, List<int> queryBytes) {
+    final start = _idxEntryOffsets[entryIndex];
+    final end = _idxBytes!.indexOf(0, start);
+    return end - start == queryBytes.length &&
+        compareBytes(_idxBytes!, start, end - start, queryBytes) == 0;
+  }
+
+  int _synLowerBound(List<int> queryBytes) {
+    var lo = 0;
+    var hi = _synEntryOffsets.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      final start = _synEntryOffsets[mid];
+      final end = _synBytes!.indexOf(0, start);
+      if (compareBytes(_synBytes!, start, end - start, queryBytes) < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  bool _synKeyEquals(int synIndex, List<int> queryBytes) {
+    final start = _synEntryOffsets[synIndex];
+    final end = _synBytes!.indexOf(0, start);
+    return end - start == queryBytes.length &&
+        compareBytes(_synBytes!, start, end - start, queryBytes) == 0;
+  }
+
+  int _synTargetAt(int synIndex) {
+    final start = _synEntryOffsets[synIndex];
+    final end = _synBytes!.indexOf(0, start);
+    return ByteData.sublistView(_synBytes!).getUint32(end + 1, Endian.big);
+  }
+
+  String _searchWordAt(int code) {
+    if (code >= 0) return _idxWordAt(code);
+    final synIndex = -code - 1;
+    final start = _synEntryOffsets[synIndex];
+    final end = _synBytes!.indexOf(0, start);
+    return utf8.decode(
+      Uint8List.sublistView(_synBytes!, start, end),
+      allowMalformed: true,
+    );
+  }
+
   /// Whether [word] (or its lowercase form, or a synonym of it) has an
   /// entry in this dictionary.
   bool exist(String word) => resolveIndex(word) != null;
@@ -300,11 +411,36 @@ class StarDictReader {
   /// Resolves [word] to an index position: exact match first, then the
   /// lowercase form, then the synonym index (which also tries lowercase).
   int? resolveIndex(String word) {
-    final direct = _wordToIndex[word] ?? _synonymToIndex[word];
-    if (direct != null) return direct;
+    final query = utf8.encode(word);
+    var index = _idxLowerBound(query);
+    if (index < _idxEntryOffsets.length && _idxKeyEquals(index, query)) {
+      return index;
+    }
+    if (_synBytes != null) {
+      final syn = _synLowerBound(query);
+      if (syn < _synEntryOffsets.length && _synKeyEquals(syn, query)) {
+        final target = _synTargetAt(syn);
+        if (target < _idxFileToSorted.length) {
+          return _idxFileToSorted[target];
+        }
+      }
+    }
     final lower = word.toLowerCase();
     if (lower != word) {
-      return _wordToIndex[lower] ?? _synonymToIndex[lower];
+      final lowerQuery = utf8.encode(lower);
+      index = _idxLowerBound(lowerQuery);
+      if (index < _idxEntryOffsets.length && _idxKeyEquals(index, lowerQuery)) {
+        return index;
+      }
+      if (_synBytes != null) {
+        final syn = _synLowerBound(lowerQuery);
+        if (syn < _synEntryOffsets.length && _synKeyEquals(syn, lowerQuery)) {
+          final target = _synTargetAt(syn);
+          if (target < _idxFileToSorted.length) {
+            return _idxFileToSorted[target];
+          }
+        }
+      }
     }
     return null;
   }
@@ -312,11 +448,14 @@ class StarDictReader {
   /// All index positions carrying exactly [word] (a word may have several
   /// entries in the `.idx`).
   List<int> _indexRangeOf(String word) {
-    final first = _wordToIndex[word];
-    if (first == null) return const [];
+    final query = utf8.encode(word);
+    final first = _idxLowerBound(query);
+    if (first >= _idxEntryOffsets.length || !_idxKeyEquals(first, query)) {
+      return const [];
+    }
     final result = <int>[first];
     var i = first + 1;
-    while (i < _words.length && _words[i] == word) {
+    while (i < _idxEntryOffsets.length && _idxKeyEquals(i, query)) {
       result.add(i);
       i++;
     }
@@ -341,10 +480,10 @@ class StarDictReader {
     }
     final entries = <StarDictEntry>[];
     for (final i in indices) {
-      final (offset, size) = _locations[i];
+      final (offset, size) = _idxLocationAt(i);
       final raw = await _readDict(offset, size);
       entries.add(
-        StarDictEntry(headword: _words[i], fields: _decodeEntry(raw)),
+        StarDictEntry(headword: _idxWordAt(i), fields: _decodeEntry(raw)),
       );
     }
     return entries;
@@ -356,22 +495,24 @@ class StarDictReader {
   List<String> search(String query, {int limit = 30}) {
     if (query.isEmpty) return const [];
     final lowerQuery = query.toLowerCase();
-    // Binary search for the first key that could carry the prefix, then
-    // scan the matching run (bounded by limit).
+    // Binary search over the lowercase-sorted search order, decoding
+    // each probed word on the fly, then a short forward scan.
     var lo = 0;
-    var hi = _searchKeys.length;
+    var hi = _searchOrder.length;
     while (lo < hi) {
       final mid = (lo + hi) >> 1;
-      if (_searchKeys[mid].compareTo(lowerQuery) < 0) {
+      if (_searchWordAt(_searchOrder[mid]).toLowerCase().compareTo(lowerQuery) <
+          0) {
         lo = mid + 1;
       } else {
         hi = mid;
       }
     }
     final results = <String>[];
-    for (var i = lo; i < _searchKeys.length && results.length < limit; i++) {
-      if (!_searchKeys[i].startsWith(lowerQuery)) break;
-      results.add(_searchWords[i]);
+    for (var i = lo; i < _searchOrder.length && results.length < limit; i++) {
+      final word = _searchWordAt(_searchOrder[i]);
+      if (!word.toLowerCase().startsWith(lowerQuery)) break;
+      results.add(word);
     }
     return results;
   }
@@ -428,105 +569,155 @@ class StarDictReader {
     await _dictFile?.close();
     _dictFile = null;
     _dictZip = null;
+    _idxBytes = null;
+    _idxEntryOffsets = [];
+    _idxFileToSorted = [];
+    _synBytes = null;
+    _synEntryOffsets = [];
+    _searchOrder = [];
+    _wordsCache = null;
     _initialized = false;
   }
 }
 
-/// The parsed index of a StarDict dictionary: everything [StarDictReader]
-/// needs from the `.idx` and `.syn` files, produced by [_parseIndexFiles].
-class _ParsedIndex {
-  final List<String> words;
-  final List<(int, int)> locations;
-  final Map<String, int> wordToIndex;
-  final Map<String, int> synonymToIndex;
-  final List<String> searchKeys;
-  final List<String> searchWords;
+/// The parsed index of a StarDict dictionary: the raw `.idx` and `.syn`
+/// bytes plus the entry start offsets and the prefix-search order,
+/// produced by [_parseStarDictIndex]. No headword strings, locations,
+/// or lookup maps are kept: lookups binary-search the bytes in place,
+/// and display words are decoded on demand.
+///
+/// The search order encodes, per entry, a code: >= 0 is an `.idx` entry
+/// index, < 0 is `-(syn entry index + 1)`. It is sorted by lowercase
+/// display word, built exactly like the old key/word pair lists
+/// (headwords first in first-occurrence order, then synonyms that do
+/// not shadow a headword), so search results are unchanged.
+class _ParsedStarDictIndex {
+  final Uint8List idxBytes;
+  final List<int> idxEntryOffsets;
+  final List<int> idxFileToSorted;
+  final int idxOffsetWidth;
+  final Uint8List? synBytes;
+  final List<int> synEntryOffsets;
+  final List<int> searchOrder;
 
-  const _ParsedIndex({
-    required this.words,
-    required this.locations,
-    required this.wordToIndex,
-    required this.synonymToIndex,
-    required this.searchKeys,
-    required this.searchWords,
+  const _ParsedStarDictIndex({
+    required this.idxBytes,
+    required this.idxEntryOffsets,
+    required this.idxFileToSorted,
+    required this.idxOffsetWidth,
+    required this.synBytes,
+    required this.synEntryOffsets,
+    required this.searchOrder,
   });
 }
 
 /// Parses the `.idx` (and `.syn`, when present) files of the dictionary at
 /// [basePath]. Runs in a background isolate (see [StarDictReader.init]).
 ///
-/// Words are decoded as UTF-8 with malformed sequences tolerated: legacy
+/// Only entry start offsets are collected (one linear scan per file);
+/// words are decoded transiently for the search order and then dropped.
+/// Malformed words are tolerated the same way as before: legacy
 /// dictionaries occasionally carry a few words in a locale encoding, and
-/// one bad word must not make the whole dictionary unloadable — it just
-/// becomes unfindable itself.
-_ParsedIndex _parseIndexFiles(String basePath, int idxOffsetBits) {
-  final words = <String>[];
-  final locations = <(int, int)>[];
-  final wordToIndex = <String, int>{};
-  final synonymToIndex = <String, int>{};
-
+/// one bad word must not make the whole dictionary unloadable.
+_ParsedStarDictIndex _parseStarDictIndex(String basePath, int idxOffsetBits) {
   final idxBytes = File('$basePath.idx').readAsBytesSync();
-  final idxData = ByteData.sublistView(idxBytes);
   final offsetWidth = idxOffsetBits ~/ 8;
+  final fileOrderOffsets = <int>[];
   var pos = 0;
-  var index = 0;
   while (pos < idxBytes.length) {
     final end = idxBytes.indexOf(0, pos);
     if (end < 0) break;
-    final word = utf8.decode(
-      Uint8List.sublistView(idxBytes, pos, end),
-      allowMalformed: true,
-    );
-    pos = end + 1;
-    final offset = offsetWidth == 8
-        ? idxData.getUint64(pos, Endian.big)
-        : idxData.getUint32(pos, Endian.big);
-    pos += offsetWidth;
-    final size = idxData.getUint32(pos, Endian.big);
-    pos += 4;
-    words.add(word);
-    locations.add((offset, size));
-    // First occurrence wins: .idx may repeat a word for multiple entries,
-    // and lookup returns all of them via the contiguous range.
-    wordToIndex.putIfAbsent(word, () => index);
-    index++;
+    fileOrderOffsets.add(pos);
+    pos = end + 1 + offsetWidth + 4;
   }
 
+  String idxWordAtFileOrder(int fileIndex) {
+    final start = fileOrderOffsets[fileIndex];
+    final end = idxBytes.indexOf(0, start);
+    return utf8.decode(
+      Uint8List.sublistView(idxBytes, start, end),
+      allowMalformed: true,
+    );
+  }
+
+  // Entry offsets in word-byte order. Real `.idx` files are already
+  // sorted, but sorting here (stable, so duplicates keep file order)
+  // also keeps lookups working on files that are not, at the cost of
+  // one int per entry.
+  int wordEnd(int start) => idxBytes.indexOf(0, start);
+  final sortedOrder = List<int>.generate(fileOrderOffsets.length, (i) => i)
+    ..sort((a, b) {
+      final startA = fileOrderOffsets[a];
+      final startB = fileOrderOffsets[b];
+      return compareBytes(
+        idxBytes,
+        startA,
+        wordEnd(startA) - startA,
+        idxBytes,
+        startB,
+        wordEnd(startB) - startB,
+      );
+    });
+  final idxEntryOffsets = [
+    for (final fileIndex in sortedOrder) fileOrderOffsets[fileIndex],
+  ];
+  final idxFileToSorted = List<int>.filled(fileOrderOffsets.length, 0);
+  for (var sorted = 0; sorted < sortedOrder.length; sorted++) {
+    idxFileToSorted[sortedOrder[sorted]] = sorted;
+  }
+
+  Uint8List? synBytes;
+  final synEntryOffsets = <int>[];
   final synFile = File('$basePath.syn');
   if (synFile.existsSync()) {
-    final synBytes = synFile.readAsBytesSync();
-    final synData = ByteData.sublistView(synBytes);
+    synBytes = synFile.readAsBytesSync();
     var synPos = 0;
     while (synPos < synBytes.length) {
       final end = synBytes.indexOf(0, synPos);
       if (end < 0) break;
-      final word = utf8.decode(
-        Uint8List.sublistView(synBytes, synPos, end),
-        allowMalformed: true,
-      );
-      synPos = end + 1;
-      final target = synData.getUint32(synPos, Endian.big);
-      synPos += 4;
-      if (target < words.length) {
-        synonymToIndex.putIfAbsent(word, () => target);
-      }
+      synEntryOffsets.add(synPos);
+      synPos = end + 1 + 4;
     }
   }
 
-  // Prefix-search index: every suggestion surface (headwords first, then
-  // synonyms that do not shadow a headword), sorted by lowercase form.
-  final pairs = <(String, String)>[
-    for (final word in wordToIndex.keys) (word.toLowerCase(), word),
-    for (final word in synonymToIndex.keys)
-      if (!wordToIndex.containsKey(word)) (word.toLowerCase(), word),
-  ]..sort((a, b) => a.$1.compareTo(b.$1));
+  String synWordAt(int synIndex) {
+    final start = synEntryOffsets[synIndex];
+    final end = synBytes!.indexOf(0, start);
+    return utf8.decode(
+      Uint8List.sublistView(synBytes, start, end),
+      allowMalformed: true,
+    );
+  }
 
-  return _ParsedIndex(
-    words: words,
-    locations: locations,
-    wordToIndex: wordToIndex,
-    synonymToIndex: synonymToIndex,
-    searchKeys: [for (final pair in pairs) pair.$1],
-    searchWords: [for (final pair in pairs) pair.$2],
+  // Prefix-search order: headwords first (first occurrence wins, as
+  // before), then synonyms that do not shadow a headword.
+  final seenWords = <String>{};
+  final pairs = <(String, int)>[];
+  for (var i = 0; i < fileOrderOffsets.length; i++) {
+    final word = idxWordAtFileOrder(i);
+    if (seenWords.add(word)) {
+      pairs.add((word.toLowerCase(), idxFileToSorted[i]));
+    }
+  }
+  if (synBytes != null) {
+    final seenSynonyms = <String>{};
+    for (var i = 0; i < synEntryOffsets.length; i++) {
+      final word = synWordAt(i);
+      if (!seenSynonyms.add(word)) continue;
+      if (seenWords.contains(word)) continue;
+      pairs.add((word.toLowerCase(), -(i + 1)));
+    }
+  }
+  // Dart's sort is stable, so equal lowercase keys keep pair order.
+  pairs.sort((a, b) => a.$1.compareTo(b.$1));
+
+  return _ParsedStarDictIndex(
+    idxBytes: idxBytes,
+    idxEntryOffsets: idxEntryOffsets,
+    idxFileToSorted: idxFileToSorted,
+    idxOffsetWidth: offsetWidth,
+    synBytes: synBytes,
+    synEntryOffsets: synEntryOffsets,
+    searchOrder: [for (final pair in pairs) pair.$2],
   );
 }
