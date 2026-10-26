@@ -8,6 +8,7 @@ import "package:charset/charset.dart";
 import "package:html_unescape/html_unescape.dart";
 
 import "cidx.dart";
+import "normalize.dart";
 
 const _utf16Decoder = Utf16Decoder();
 
@@ -83,6 +84,10 @@ class DictReader {
   bool _headerLoaded = false;
   File? _dict;
   late List<(int, String)> _keyList;
+
+  /// Normalised form of every headword in [_keyList], used for matching only.
+  /// Display and record reads always go back to the raw key.
+  late List<String> _lookupKeys;
   late List<int> _lookupKeyIndices;
   bool _keyListReady = false;
 
@@ -170,13 +175,10 @@ class DictReader {
 
       if (readKeys) {
         _keyList = initData.keyList!;
+        _lookupKeys = initData.lookupKeys!;
         _keyListReady = true;
-        final lookupKeyIndices = initData.lookupKeyIndices;
-        if (lookupKeyIndices != null) {
-          _lookupKeyIndices = lookupKeyIndices;
-        } else {
-          _rebuildLookupKeyList();
-        }
+        _lookupKeyIndices =
+            initData.lookupKeyIndices ?? _buildLookupKeyIndices(_lookupKeys);
       }
       numEntries = initData.numEntries!;
       _recordBlockOffset = initData.recordBlockOffset!;
@@ -536,8 +538,12 @@ class DictReader {
       final index = _cidxLowerBound(query);
       if (index >= _cidxEntryOffsets!.length) return null;
       if (!_cidxKeyEquals(index, query)) return null;
-      final (_, _, recordStart, recordEnd) = _cidxEntry(index);
-      return _buildRecordOffsetInfo(key, recordStart, recordEnd);
+      final entry = _cidxEntry(index);
+      return _buildRecordOffsetInfo(
+        _cidxRawKey(entry),
+        entry.recordStart,
+        entry.recordEnd,
+      );
     }
 
     final keyIndex = _lookupBinarySearch(key);
@@ -551,7 +557,11 @@ class DictReader {
     final recordEnd = (physicalIndex < _keyList.length - 1)
         ? _keyList[physicalIndex + 1].$1
         : -1; // -1 indicates the last record
-    return _buildRecordOffsetInfo(key, recordStart, recordEnd);
+    return _buildRecordOffsetInfo(
+      _keyList[physicalIndex].$2,
+      recordStart,
+      recordEnd,
+    );
   }
 
   /// Locates the position information of all occurrences of a key (word).
@@ -566,8 +576,12 @@ class DictReader {
       var index = _cidxLowerBound(query);
       while (
           index < _cidxEntryOffsets!.length && _cidxKeyEquals(index, query)) {
-        final (_, _, recordStart, recordEnd) = _cidxEntry(index);
-        final offsetInfo = _buildRecordOffsetInfo(key, recordStart, recordEnd);
+        final entry = _cidxEntry(index);
+        final offsetInfo = _buildRecordOffsetInfo(
+          _cidxRawKey(entry),
+          entry.recordStart,
+          entry.recordEnd,
+        );
         if (offsetInfo != null) {
           results.add(offsetInfo);
         }
@@ -577,22 +591,27 @@ class DictReader {
     }
 
     final results = <RecordOffsetInfo>[];
+    final query = normalizeKey(key);
     // Use lowerBound to find the first potential match.
     var keyIndex = _lookupLowerBound(key);
 
     if (keyIndex == _lookupKeyIndices.length ||
-        _keyList[_lookupKeyIndices[keyIndex]].$2 != key) {
+        _lookupKeys[_lookupKeyIndices[keyIndex]] != query) {
       return [];
     }
 
     while (keyIndex < _lookupKeyIndices.length &&
-        _keyList[_lookupKeyIndices[keyIndex]].$2 == key) {
+        _lookupKeys[_lookupKeyIndices[keyIndex]] == query) {
       final physicalIndex = _lookupKeyIndices[keyIndex];
       final recordStart = _keyList[physicalIndex].$1;
       final recordEnd = (physicalIndex < _keyList.length - 1)
           ? _keyList[physicalIndex + 1].$1
           : -1; // -1 indicates the last record
-      final offsetInfo = _buildRecordOffsetInfo(key, recordStart, recordEnd);
+      final offsetInfo = _buildRecordOffsetInfo(
+        _keyList[physicalIndex].$2,
+        recordStart,
+        recordEnd,
+      );
       if (offsetInfo != null) {
         results.add(offsetInfo);
       }
@@ -614,11 +633,17 @@ class DictReader {
       var index = _cidxLowerBound(query);
       while (index < _cidxEntryOffsets!.length) {
         if (limit != null && results.length >= limit) break;
-        final (keyOffset, keyLength, _, _) = _cidxEntry(index);
-        if (!startsWithBytes(_cidxBody!, keyOffset, keyLength, query)) break;
-        results.add(utf8.decode(
-          Uint8List.sublistView(_cidxBody!, keyOffset, keyOffset + keyLength),
-        ));
+        final entry = _cidxEntry(index);
+        if (!startsWithBytes(
+          _cidxBody!,
+          entry.keyOffset,
+          entry.keyLength,
+          query,
+        )) {
+          break;
+        }
+        // Suggestions show the dictionary spelling, not the lookup key.
+        results.add(_cidxRawKey(entry));
         index++;
       }
       return results;
@@ -647,7 +672,7 @@ class DictReader {
   /// query cannot be represented (unpaired surrogates).
   static List<int>? _encodeQuery(String key) {
     try {
-      return utf8.encode(key);
+      return utf8.encode(normalizeKey(key));
     } catch (_) {
       return null;
     }
@@ -655,23 +680,29 @@ class DictReader {
 
   /// (keyOffset, keyLength, recordStart, recordEnd) of the [sortedIndex]-th
   /// entry in the loaded `.cidx` body.
-  (int, int, int, int) _cidxEntry(int sortedIndex) {
+  CidxEntryLayout _cidxEntry(int sortedIndex) =>
+      cidxEntryAt(_cidxBody!, sortedIndex, _cidxEntryOffsets![sortedIndex]);
+
+  /// The headword as the dictionary spells it, for display and record reads.
+  String _cidxRawKey(CidxEntryLayout entry) {
     final body = _cidxBody!;
-    final entryStart = _cidxEntryOffsets![sortedIndex];
-    final keyLength =
-        ByteData.sublistView(body).getUint32(entryStart, Endian.big);
-    final keyOffset = entryStart + 4;
-    final recordStart =
-        ByteData.sublistView(body).getUint64(keyOffset + keyLength, Endian.big);
-    final recordEnd = ByteData.sublistView(body)
-        .getUint64(keyOffset + keyLength + 8, Endian.big);
-    return (keyOffset, keyLength, recordStart, recordEnd);
+    final rawOffset = entry.rawOffset;
+    final rawLength = entry.rawLength;
+    if (rawOffset == null || rawLength == null) {
+      return utf8.decode(
+        Uint8List.sublistView(
+            body, entry.keyOffset, entry.keyOffset + entry.keyLength),
+      );
+    }
+    return utf8.decode(
+      Uint8List.sublistView(body, rawOffset, rawOffset + rawLength),
+    );
   }
 
   bool _cidxKeyEquals(int sortedIndex, List<int> query) {
-    final (keyOffset, keyLength, _, _) = _cidxEntry(sortedIndex);
-    return keyLength == query.length &&
-        compareBytes(_cidxBody!, keyOffset, keyLength, query) == 0;
+    final entry = _cidxEntry(sortedIndex);
+    return entry.keyLength == query.length &&
+        compareBytes(_cidxBody!, entry.keyOffset, entry.keyLength, query) == 0;
   }
 
   /// First entry whose key is >= [query] in UTF-8 byte order.
@@ -681,8 +712,9 @@ class DictReader {
     var hi = offsets.length;
     while (lo < hi) {
       final mid = (lo + hi) >> 1;
-      final (keyOffset, keyLength, _, _) = _cidxEntry(mid);
-      if (compareBytes(_cidxBody!, keyOffset, keyLength, query) < 0) {
+      final entry = _cidxEntry(mid);
+      if (compareBytes(_cidxBody!, entry.keyOffset, entry.keyLength, query) <
+          0) {
         lo = mid + 1;
       } else {
         hi = mid;
@@ -702,13 +734,8 @@ class DictReader {
     }
     final entries = <(int, String)>[];
     for (var i = 0; i < _cidxEntryOffsets!.length; i++) {
-      final (keyOffset, keyLength, recordStart, _) = _cidxEntry(i);
-      entries.add((
-        recordStart,
-        utf8.decode(
-          Uint8List.sublistView(_cidxBody!, keyOffset, keyOffset + keyLength),
-        ),
-      ));
+      final entry = _cidxEntry(i);
+      entries.add((entry.recordStart, _cidxRawKey(entry)));
     }
     // Dart's sort is stable, so equal record starts keep index order.
     entries.sort((a, b) => a.$1.compareTo(b.$1));
@@ -717,11 +744,13 @@ class DictReader {
   }
 
   int _lookupBinarySearch(String key) {
+    final query = normalizeKey(key);
     var min = 0;
     var max = _lookupKeyIndices.length;
     while (min < max) {
       final middle = min + ((max - min) >> 1);
-      final comparison = _keyList[_lookupKeyIndices[middle]].$2.compareTo(key);
+      final comparison =
+          _lookupKeys[_lookupKeyIndices[middle]].compareTo(query);
       if (comparison == 0) {
         return middle;
       }
@@ -735,11 +764,13 @@ class DictReader {
   }
 
   int _lookupLowerBound(String key) {
+    final query = normalizeKey(key);
     var min = 0;
     var max = _lookupKeyIndices.length;
     while (min < max) {
       final middle = min + ((max - min) >> 1);
-      final comparison = _keyList[_lookupKeyIndices[middle]].$2.compareTo(key);
+      final comparison =
+          _lookupKeys[_lookupKeyIndices[middle]].compareTo(query);
       if (comparison < 0) {
         min = middle + 1;
       } else {
@@ -750,7 +781,8 @@ class DictReader {
   }
 
   void _rebuildLookupKeyList() {
-    _lookupKeyIndices = _buildLookupKeyIndices(_keyList);
+    _lookupKeys = [for (final entry in _keyList) lookupKeyOf(entry.$2)];
+    _lookupKeyIndices = _buildLookupKeyIndices(_lookupKeys);
   }
 
   void _buildRecordBlockIndex() {
@@ -859,14 +891,15 @@ class DictReader {
   /// Collects all matching keys starting from a given index.
   List<String> _collectMatches(
       List<int> list, String key, int startIndex, int? limit) {
+    final query = normalizeKey(key);
     final matchedKeys = <String>[];
     for (var i = startIndex; i < list.length; i++) {
       if (limit != null && matchedKeys.length >= limit) {
         break;
       }
-      final currentKey = _keyList[list[i]].$2;
-      if (currentKey.startsWith(key)) {
-        matchedKeys.add(currentKey);
+      if (_lookupKeys[list[i]].startsWith(query)) {
+        // Suggestions are displayed, so hand back the original spelling.
+        matchedKeys.add(_keyList[list[i]].$2);
       } else {
         // Since the list is sorted, we can stop as soon as we find a non-match.
         break;
@@ -1548,6 +1581,7 @@ class _DictInitData {
 
   // For _readKeys
   List<(int, String)>? keyList;
+  List<String>? lookupKeys;
   List<int>? lookupKeyIndices;
   int? numEntries;
 
@@ -1562,10 +1596,13 @@ class _DictInitData {
 /// keep the original order). This is an O(n log n) sort over every
 /// headword, so it runs inside whichever isolate already holds the key
 /// list (key scan) instead of on the caller's isolate.
-List<int> _buildLookupKeyIndices(List<(int, String)> keyList) {
-  final lookupKeyIndices = List<int>.generate(keyList.length, (index) => index);
+List<int> _buildLookupKeyIndices(List<String> lookupKeys) {
+  final lookupKeyIndices = List<int>.generate(
+    lookupKeys.length,
+    (index) => index,
+  );
   lookupKeyIndices.sort((a, b) {
-    final keyComparison = keyList[a].$2.compareTo(keyList[b].$2);
+    final keyComparison = lookupKeys[a].compareTo(lookupKeys[b]);
     return keyComparison != 0 ? keyComparison : a.compareTo(b);
   });
   return lookupKeyIndices;
@@ -1594,9 +1631,15 @@ Future<_DictInitData> _initDictIsolate(
 
   if (readKeys) {
     initData.keyList = await reader._readKeys();
-    // Sort the lookup index here, in the isolate that already holds the
-    // key list, instead of on the caller's isolate after the transfer.
-    initData.lookupKeyIndices = _buildLookupKeyIndices(initData.keyList!);
+    // Normalise and sort the lookup index here, in the isolate that already
+    // holds the key list, instead of on the caller's isolate after the
+    // transfer. `lookupKeyOf` keeps the original String whenever the headword
+    // is already in NFC, so the extra list stays cheap for the ASCII and CJK
+    // dictionaries that need no rewriting at all.
+    initData.lookupKeys = [
+      for (final entry in initData.keyList!) lookupKeyOf(entry.$2),
+    ];
+    initData.lookupKeyIndices = _buildLookupKeyIndices(initData.lookupKeys!);
     initData.numEntries = reader.numEntries;
     initData.recordBlockOffset = reader._recordBlockOffset;
   } else if (readRecordBlockInfo) {

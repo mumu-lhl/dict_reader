@@ -4,6 +4,7 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'cidx.dart';
+import 'normalize.dart';
 
 /// One typed field inside a StarDict entry.
 ///
@@ -223,6 +224,10 @@ class StarDictReader {
   // from the index bytes on demand, so search() costs one decode per
   // binary-search probe plus one per returned match.
   List<int> _searchOrder = [];
+  // NFC spelling -> entry index, only for headwords that are not NFC
+  // themselves. Populated by the index parse; empty for most dictionaries.
+  Map<String, int> _normalizedEntries = const {};
+  Map<String, int> _normalizedSynonyms = const {};
   List<String>? _wordsCache;
 
   /// All headwords, in sorted index order. Decoded lazily on first
@@ -288,6 +293,8 @@ class StarDictReader {
     _synBytes = parsed.synBytes;
     _synEntryOffsets = parsed.synEntryOffsets;
     _searchOrder = parsed.searchOrder;
+    _normalizedEntries = parsed.normalizedEntries;
+    _normalizedSynonyms = parsed.normalizedSynonyms;
     final dictSource = _dictSource;
     if (dictSource == null) {
       throw StateError('StarDict dictionary data (.dict/.dict.dz) not found '
@@ -411,6 +418,15 @@ class StarDictReader {
   /// Resolves [word] to an index position: exact match first, then the
   /// lowercase form, then the synonym index (which also tries lowercase).
   int? resolveIndex(String word) {
+    // Headwords that are stored decomposed are reachable under their NFC
+    // spelling through this map; everything else falls through to the byte
+    // search below, which is also what keeps the common path allocation-free.
+    final lookup = normalizeKey(word);
+    final normalized = _normalizedEntries[lookup];
+    if (normalized != null) return normalized;
+    final normalizedSynonym = _normalizedSynonyms[lookup];
+    if (normalizedSynonym != null) return normalizedSynonym;
+
     final query = utf8.encode(word);
     var index = _idxLowerBound(query);
     if (index < _idxEntryOffsets.length && _idxKeyEquals(index, query)) {
@@ -469,10 +485,18 @@ class StarDictReader {
     if (!_initialized) {
       throw StateError('StarDictReader.init() has not completed');
     }
-    var indices = _indexRangeOf(word);
+    // A decomposed query has to be turned back into the dictionary's own
+    // spelling before the byte search, otherwise the range is empty even
+    // though `resolveIndex` can find the entry.
+    var effective = word;
+    if (normalizeKey(word) != word) {
+      final target = resolveIndex(word);
+      if (target != null) effective = _idxWordAt(target);
+    }
+    var indices = _indexRangeOf(effective);
     if (indices.isEmpty) {
-      final lower = word.toLowerCase();
-      if (lower != word) indices = _indexRangeOf(lower);
+      final lower = effective.toLowerCase();
+      if (lower != effective) indices = _indexRangeOf(lower);
     }
     if (indices.isEmpty) {
       final target = resolveIndex(word);
@@ -494,15 +518,18 @@ class StarDictReader {
   /// the pre-sorted index built by [init] instead of scanning every word.
   List<String> search(String query, {int limit = 30}) {
     if (query.isEmpty) return const [];
-    final lowerQuery = query.toLowerCase();
+    // Normalise both sides: the search order is sorted by the lowercased NFC
+    // form, so a decomposed query still lands on the right headwords.
+    final lowerQuery = normalizeKey(query).toLowerCase();
     // Binary search over the lowercase-sorted search order, decoding
     // each probed word on the fly, then a short forward scan.
     var lo = 0;
     var hi = _searchOrder.length;
     while (lo < hi) {
       final mid = (lo + hi) >> 1;
-      if (_searchWordAt(_searchOrder[mid]).toLowerCase().compareTo(lowerQuery) <
-          0) {
+      final probe =
+          normalizeKey(_searchWordAt(_searchOrder[mid])).toLowerCase();
+      if (probe.compareTo(lowerQuery) < 0) {
         lo = mid + 1;
       } else {
         hi = mid;
@@ -511,7 +538,7 @@ class StarDictReader {
     final results = <String>[];
     for (var i = lo; i < _searchOrder.length && results.length < limit; i++) {
       final word = _searchWordAt(_searchOrder[i]);
-      if (!word.toLowerCase().startsWith(lowerQuery)) break;
+      if (!normalizeKey(word).toLowerCase().startsWith(lowerQuery)) break;
       results.add(word);
     }
     return results;
@@ -600,6 +627,13 @@ class _ParsedStarDictIndex {
   final List<int> synEntryOffsets;
   final List<int> searchOrder;
 
+  /// NFC form -> sorted `.idx` entry index, for headwords whose spelling is
+  /// not already NFC. Empty for the (common) dictionaries that need nothing.
+  final Map<String, int> normalizedEntries;
+
+  /// NFC form -> sorted `.idx` entry index a synonym points at.
+  final Map<String, int> normalizedSynonyms;
+
   const _ParsedStarDictIndex({
     required this.idxBytes,
     required this.idxEntryOffsets,
@@ -608,6 +642,8 @@ class _ParsedStarDictIndex {
     required this.synBytes,
     required this.synEntryOffsets,
     required this.searchOrder,
+    required this.normalizedEntries,
+    required this.normalizedSynonyms,
   });
 }
 
@@ -693,19 +729,39 @@ _ParsedStarDictIndex _parseStarDictIndex(String basePath, int idxOffsetBits) {
   // before), then synonyms that do not shadow a headword.
   final seenWords = <String>{};
   final pairs = <(String, int)>[];
+  final normalizedEntries = <String, int>{};
   for (var i = 0; i < fileOrderOffsets.length; i++) {
     final word = idxWordAtFileOrder(i);
     if (seenWords.add(word)) {
-      pairs.add((word.toLowerCase(), idxFileToSorted[i]));
+      pairs.add((normalizeKey(word).toLowerCase(), idxFileToSorted[i]));
+    }
+    final lookup = normalizeKey(word);
+    if (lookup != word) {
+      normalizedEntries.putIfAbsent(lookup, () => idxFileToSorted[i]);
     }
   }
+  final normalizedSynonyms = <String, int>{};
   if (synBytes != null) {
     final seenSynonyms = <String>{};
     for (var i = 0; i < synEntryOffsets.length; i++) {
       final word = synWordAt(i);
       if (!seenSynonyms.add(word)) continue;
       if (seenWords.contains(word)) continue;
-      pairs.add((word.toLowerCase(), -(i + 1)));
+      pairs.add((normalizeKey(word).toLowerCase(), -(i + 1)));
+      final lookup = normalizeKey(word);
+      if (lookup != word) {
+        final start = synEntryOffsets[i];
+        final end = synBytes.indexOf(0, start);
+        if (end < 0 || end + 5 > synBytes.length) continue;
+        final target =
+            ByteData.sublistView(synBytes).getUint32(end + 1, Endian.big);
+        if (target < idxFileToSorted.length) {
+          normalizedSynonyms.putIfAbsent(
+            lookup,
+            () => idxFileToSorted[target],
+          );
+        }
+      }
     }
   }
   // Dart's sort is stable, so equal lowercase keys keep pair order.
@@ -719,5 +775,7 @@ _ParsedStarDictIndex _parseStarDictIndex(String basePath, int idxOffsetBits) {
     synBytes: synBytes,
     synEntryOffsets: synEntryOffsets,
     searchOrder: [for (final pair in pairs) pair.$2],
+    normalizedEntries: normalizedEntries,
+    normalizedSynonyms: normalizedSynonyms,
   );
 }
