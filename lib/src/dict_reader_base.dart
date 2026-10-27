@@ -8,6 +8,7 @@ import "package:charset/charset.dart";
 import "package:html_unescape/html_unescape.dart";
 
 import "cidx.dart";
+import "exceptions.dart";
 import "normalize.dart";
 
 const _utf16Decoder = Utf16Decoder();
@@ -1041,7 +1042,7 @@ class DictReader {
     if (compressionMethod == 2) {
       return zlib.decode(data);
     }
-    throw "Compression method not supported";
+    throw UnsupportedCompressionException(compressionMethod);
   }
 
   List<(int, String)> _decodeKeyBlock(
