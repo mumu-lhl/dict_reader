@@ -68,7 +68,6 @@ void main() {
 
   group('cidx normalisation metadata', () {
     test('uses a stable, non-zero algorithm id', () {
-      expect(normalizationNone, 0);
       expect(normalizationNfc, 1);
     });
 

@@ -418,15 +418,9 @@ class StarDictReader {
   /// Resolves [word] to an index position: exact match first, then the
   /// lowercase form, then the synonym index (which also tries lowercase).
   int? resolveIndex(String word) {
-    // Headwords that are stored decomposed are reachable under their NFC
-    // spelling through this map; everything else falls through to the byte
-    // search below, which is also what keeps the common path allocation-free.
-    final lookup = normalizeKey(word);
-    final normalized = _normalizedEntries[lookup];
-    if (normalized != null) return normalized;
-    final normalizedSynonym = _normalizedSynonyms[lookup];
-    if (normalizedSynonym != null) return normalizedSynonym;
-
+    // Exact spelling first: a stored NFC headword must win over a
+    // decomposed twin that normalises to the same key, and the exact byte
+    // search is what keeps the common path allocation-free.
     final query = utf8.encode(word);
     var index = _idxLowerBound(query);
     if (index < _idxEntryOffsets.length && _idxKeyEquals(index, query)) {
@@ -441,6 +435,35 @@ class StarDictReader {
         }
       }
     }
+
+    // Normalised spelling: a decomposed query must reach a composed
+    // headword, and a composed query must reach a decomposed one. The byte
+    // search below covers entries stored in NFC; the maps after it cover
+    // entries stored decomposed, whose bytes can never equal the
+    // normalised query.
+    final lookup = normalizeKey(word);
+    if (lookup != word) {
+      final normalizedQuery = utf8.encode(lookup);
+      index = _idxLowerBound(normalizedQuery);
+      if (index < _idxEntryOffsets.length &&
+          _idxKeyEquals(index, normalizedQuery)) {
+        return index;
+      }
+      if (_synBytes != null) {
+        final syn = _synLowerBound(normalizedQuery);
+        if (syn < _synEntryOffsets.length &&
+            _synKeyEquals(syn, normalizedQuery)) {
+          final target = _synTargetAt(syn);
+          if (target < _idxFileToSorted.length) {
+            return _idxFileToSorted[target];
+          }
+        }
+      }
+    }
+    final normalized = _normalizedEntries[lookup];
+    if (normalized != null) return normalized;
+    final normalizedSynonym = _normalizedSynonyms[lookup];
+    if (normalizedSynonym != null) return normalizedSynonym;
     final lower = word.toLowerCase();
     if (lower != word) {
       final lowerQuery = utf8.encode(lower);

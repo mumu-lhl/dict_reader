@@ -1,8 +1,5 @@
 import 'package:unorm_dart/unorm_dart.dart' as unorm;
 
-/// No normalisation: the index stores the headword exactly as the file has it.
-const int normalizationNone = 0;
-
 /// Unicode NFC, see [normalizeKey].
 const int normalizationNfc = 1;
 

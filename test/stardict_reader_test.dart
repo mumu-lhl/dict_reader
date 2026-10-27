@@ -221,4 +221,95 @@ void main() {
     expect(reader.search('ec'), ['echo', 'eclipse']);
     await reader.close();
   });
+
+  group('Unicode NFC lookup', () {
+    test('finds a decomposed headword from an NFC query, keeping its spelling',
+        () async {
+      final builder = StarDictFixtureBuilder()
+        ..add('ingle\u0301s', [('m', 'spanish')])
+        ..add('plain', [('m', 'P')]);
+      final base = await builder.write(dir, 'nfc');
+      final reader = StarDictReader(base);
+      await reader.init();
+
+      expect(reader.exist('ingl\u00E9s'), isTrue);
+      expect(reader.exist('ingle\u0301s'), isTrue);
+      final entries = await reader.lookup('ingl\u00E9s');
+      expect(entries.single.headword, 'ingle\u0301s');
+      expect(entries.single.fields.single.text, 'spanish');
+      expect(reader.search('ingl'), ['ingle\u0301s']);
+      await reader.close();
+    });
+
+    test('finds a composed headword from a decomposed query', () async {
+      final builder = StarDictFixtureBuilder()
+        ..add('ingl\u00E9s', [('m', 'spanish')]);
+      final base = await builder.write(dir, 'nfc-reverse');
+      final reader = StarDictReader(base);
+      await reader.init();
+
+      // The headword is stored composed, so the byte search has to run
+      // against the normalised query: the decomposed spelling alone never
+      // matches the stored bytes.
+      expect(reader.exist('ingle\u0301s'), isTrue);
+      final entries = await reader.lookup('ingle\u0301s');
+      expect(entries.single.headword, 'ingl\u00E9s');
+      expect(entries.single.fields.single.text, 'spanish');
+      await reader.close();
+    });
+
+    test('an exact spelling wins over a twin that normalises alike', () async {
+      final builder = StarDictFixtureBuilder()
+        ..add('ingl\u00E9s', [('m', 'composed')])
+        ..add('ingle\u0301s', [('m', 'decomposed')]);
+      final base = await builder.write(dir, 'nfc-twins');
+      final reader = StarDictReader(base);
+      await reader.init();
+
+      final composed = reader.resolveIndex('ingl\u00E9s');
+      expect(reader.wordAt(composed!), 'ingl\u00E9s');
+      final decomposed = reader.resolveIndex('ingle\u0301s');
+      expect(reader.wordAt(decomposed!), 'ingle\u0301s');
+
+      final entries = await reader.lookup('ingl\u00E9s');
+      expect(entries, hasLength(1));
+      expect(entries.single.fields.single.text, 'composed');
+      await reader.close();
+    });
+
+    test('resolves a decomposed synonym from either spelling', () async {
+      final builder = StarDictFixtureBuilder()
+        ..add('banana', [('m', 'a long yellow fruit')])
+        ..addSynonym('pla\u0301tano', 0);
+      final base = await builder.write(dir, 'nfc-synonym');
+      final reader = StarDictReader(base);
+      await reader.init();
+
+      expect(reader.exist('pl\u00E1tano'), isTrue);
+      expect(reader.exist('pla\u0301tano'), isTrue);
+      expect(
+        (await reader.lookup('pl\u00E1tano')).single.headword,
+        'banana',
+      );
+      expect(
+        (await reader.lookup('pla\u0301tano')).single.headword,
+        'banana',
+      );
+      await reader.close();
+    });
+
+    test('prefix search matches a decomposed query against either spelling',
+        () async {
+      final builder = StarDictFixtureBuilder()
+        ..add('ingle\u0301s', [('m', 'spanish')])
+        ..add('plain', [('m', 'P')]);
+      final base = await builder.write(dir, 'nfc-search');
+      final reader = StarDictReader(base);
+      await reader.init();
+
+      expect(reader.search('ingl\u00E9'), ['ingle\u0301s']);
+      expect(reader.search('ingle\u0301'), ['ingle\u0301s']);
+      await reader.close();
+    });
+  });
 }
