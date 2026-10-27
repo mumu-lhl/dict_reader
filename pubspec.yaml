@@ -15,3 +15,4 @@ dependencies:
   blockchain_utils: ">=3.4.0 <8.0.0"
   collection: ^1.19.1
   html_unescape: ^2.0.0
+  unorm_dart: ^0.3.3

@@ -535,4 +535,184 @@ void main() {
       throwsA(isA<FormatException>()),
     );
   });
+
+  group('Unicode NFC lookup', () {
+    test('finds an NFD headword from an NFC query, keeping its spelling',
+        () async {
+      final directory =
+          await Directory.systemTemp.createTemp('dict_reader_nfc_test_');
+      addTearDown(() => directory.delete(recursive: true));
+      final file = await _createFixture(
+        directory,
+        entries: [
+          ('ingle\u0301s', 'spanish'),
+          ('plain', 'P'),
+        ],
+      );
+
+      final reader = DictReader(file.path);
+      await reader.initDict();
+      addTearDown(reader.close);
+
+      expect(reader.exist('ingl\u00E9s'), isTrue);
+      expect(reader.exist('ingle\u0301s'), isTrue);
+
+      final offsets = await reader.locateAll('ingl\u00E9s');
+      expect(offsets, hasLength(1));
+      // Callers display this, so it must stay the dictionary's spelling.
+      expect(offsets.single.keyText, 'ingle\u0301s');
+      expect(await reader.readOneMdx(offsets.single), 'spanish');
+
+      expect(reader.search('ingl'), ['ingle\u0301s']);
+    });
+
+    test('finds an NFC headword from an NFD query', () async {
+      final directory =
+          await Directory.systemTemp.createTemp('dict_reader_nfc_reverse_');
+      addTearDown(() => directory.delete(recursive: true));
+      final file = await _createFixture(
+        directory,
+        entries: [
+          ('ingl\u00E9s', 'spanish'),
+        ],
+      );
+
+      final reader = DictReader(file.path);
+      await reader.initDict();
+      addTearDown(reader.close);
+
+      expect(reader.exist('ingle\u0301s'), isTrue);
+      final offset = await reader.locate('ingle\u0301s');
+      expect(offset, isNotNull);
+      expect(offset!.keyText, 'ingl\u00E9s');
+    });
+
+    test('keeps both spellings when two headwords normalise alike', () async {
+      final directory =
+          await Directory.systemTemp.createTemp('dict_reader_nfc_collide_');
+      addTearDown(() => directory.delete(recursive: true));
+      final file = await _createFixture(
+        directory,
+        entries: [
+          ('e\u0301', 'decomposed'),
+          ('\u00E9', 'composed'),
+        ],
+      );
+
+      final reader = DictReader(file.path);
+      await reader.initDict();
+      addTearDown(reader.close);
+
+      final offsets = await reader.locateAll('\u00E9');
+      expect(offsets, hasLength(2));
+      expect(
+        offsets.map((offset) => offset.keyText).toSet(),
+        {'e\u0301', '\u00E9'},
+      );
+      expect(reader.search('\u00E9'), hasLength(2));
+    });
+
+    test('cidx round-trip keeps raw spellings and normalisation metadata',
+        () async {
+      final directory =
+          await Directory.systemTemp.createTemp('dict_reader_nfc_cidx_');
+      addTearDown(() => directory.delete(recursive: true));
+      final file = await _createFixture(
+        directory,
+        entries: [
+          ('ingle\u0301s', 'spanish'),
+          ('plain', 'P'),
+        ],
+      );
+
+      final source = DictReader(file.path);
+      await source.initDict();
+      final cidx = await source.exportCidx();
+      await source.close();
+
+      final parsed = parseCidx(cidx);
+      expect(parsed.header.normalization, normalizationNfc);
+      expect(parsed.header.unicodeVersion, normalizationUnicodeVersion);
+
+      final imported = DictReader(file.path);
+      addTearDown(imported.close);
+      await imported.importCidx(cidx);
+
+      expect(imported.exist('ingl\u00E9s'), isTrue);
+      final offsets = await imported.locateAll('ingl\u00E9s');
+      expect(offsets, hasLength(1));
+      expect(offsets.single.keyText, 'ingle\u0301s');
+      expect(await imported.readOneMdx(offsets.single), 'spanish');
+      expect(imported.search('ingl'), ['ingle\u0301s']);
+
+      // File-order iteration after a cidx import must also expose the raw
+      // spelling, not the normalised key.
+      final keys = await imported
+          .readWithMdxData()
+          .map((record) => record.keyText)
+          .toList();
+      expect(keys, ['ingle\u0301s', 'plain']);
+    });
+
+    test('cidx stores the original spelling only when it differs', () async {
+      final directory =
+          await Directory.systemTemp.createTemp('dict_reader_nfc_raw_');
+      addTearDown(() => directory.delete(recursive: true));
+      final file = await _createFixture(
+        directory,
+        entries: [
+          // Already NFC: the key is its own spelling, so no duplicate.
+          ('ingl\u00E9s', 'nfc'),
+          // Decomposed: the key loses the U+0301, the spelling must survive.
+          ('ingle\u0301s', 'nfd'),
+          ('plain', 'ascii'),
+        ],
+      );
+
+      final source = DictReader(file.path);
+      await source.initDict();
+      final cidx = await source.exportCidx();
+      await source.close();
+
+      final parsed = parseCidx(cidx);
+      final withRaw = [
+        for (var i = 0; i < parsed.entryOffsets.length; i++)
+          if (cidxEntryAt(parsed.body, i, parsed.entryOffsets[i]).rawOffset !=
+              null)
+            i,
+      ];
+      expect(withRaw, hasLength(1));
+
+      // Both spellings collapse to one key, and reading either returns the
+      // spelling the dictionary actually uses.
+      final imported = DictReader(file.path);
+      addTearDown(imported.close);
+      await imported.importCidx(cidx);
+      final offsets = await imported.locateAll('ingl\u00E9s');
+      expect(offsets.map((offset) => offset.keyText), hasLength(2));
+      expect(await imported.readOneMdx(offsets.first), isNotEmpty);
+    });
+
+    test('rejects a cidx built with another Unicode table version', () async {
+      final directory =
+          await Directory.systemTemp.createTemp('dict_reader_nfc_stale_');
+      addTearDown(() => directory.delete(recursive: true));
+      final file = await _createFixture(directory);
+
+      final source = DictReader(file.path);
+      await source.initDict();
+      final cidx = await source.exportCidx();
+      await source.close();
+      // unicodeVersion field: magic(4) version(4) collation(4)
+      // normalization(4) -> bytes 16..20, big-endian.
+      cidx[19] = 99;
+
+      final reader = DictReader(file.path);
+      addTearDown(reader.close);
+      await expectLater(
+        () async => reader.importCidx(cidx),
+        throwsA(isA<FormatException>()),
+      );
+    });
+  });
 }
