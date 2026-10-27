@@ -180,6 +180,10 @@ class DictZipReader {
 /// Reader for StarDict dictionaries (`.ifo` / `.idx` / `.dict` files, with
 /// optional `.dict.dz` dictzip compression and a `.syn` synonym index).
 ///
+/// The index files may use the gzip-compressed form the format allows
+/// (`.idx.gz`, `.syn.gz`); they are decompressed transparently when the
+/// plain file is absent.
+///
 /// The reader is constructed with the dictionary's base path — the `.ifo`
 /// path without its extension, the same identity the companion files share:
 ///
@@ -670,6 +674,19 @@ class _ParsedStarDictIndex {
   });
 }
 
+/// Reads a StarDict index file, transparently decompressing the `.gz`
+/// form the format allows when the plain file is absent. Returns null
+/// when neither form exists.
+Uint8List? _readStarDictIndexFile(String path) {
+  final plain = File(path);
+  if (plain.existsSync()) return plain.readAsBytesSync();
+  final gzipped = File('$path.gz');
+  if (gzipped.existsSync()) {
+    return Uint8List.fromList(GZipCodec().decode(gzipped.readAsBytesSync()));
+  }
+  return null;
+}
+
 /// Parses the `.idx` (and `.syn`, when present) files of the dictionary at
 /// [basePath]. Runs in a background isolate (see [StarDictReader.init]).
 ///
@@ -679,7 +696,12 @@ class _ParsedStarDictIndex {
 /// dictionaries occasionally carry a few words in a locale encoding, and
 /// one bad word must not make the whole dictionary unloadable.
 _ParsedStarDictIndex _parseStarDictIndex(String basePath, int idxOffsetBits) {
-  final idxBytes = File('$basePath.idx').readAsBytesSync();
+  final idxBytes = _readStarDictIndexFile('$basePath.idx');
+  if (idxBytes == null) {
+    throw StateError(
+      'StarDict index (.idx/.idx.gz) not found for $basePath',
+    );
+  }
   final offsetWidth = idxOffsetBits ~/ 8;
   final fileOrderOffsets = <int>[];
   var pos = 0;
@@ -727,12 +749,12 @@ _ParsedStarDictIndex _parseStarDictIndex(String basePath, int idxOffsetBits) {
 
   Uint8List? synBytes;
   final synEntryOffsets = <int>[];
-  final synFile = File('$basePath.syn');
-  if (synFile.existsSync()) {
-    synBytes = synFile.readAsBytesSync();
+  final synData = _readStarDictIndexFile('$basePath.syn');
+  if (synData != null) {
+    synBytes = synData;
     var synPos = 0;
-    while (synPos < synBytes.length) {
-      final end = synBytes.indexOf(0, synPos);
+    while (synPos < synData.length) {
+      final end = synData.indexOf(0, synPos);
       if (end < 0) break;
       synEntryOffsets.add(synPos);
       synPos = end + 1 + 4;

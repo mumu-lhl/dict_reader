@@ -312,4 +312,55 @@ void main() {
       await reader.close();
     });
   });
+
+  group('gzip-compressed index files', () {
+    // The format allows `.idx.gz` / `.syn.gz` in place of the plain
+    // files; dictionaries are commonly distributed that way.
+
+    test('opens a dictionary whose index is only available as .idx.gz',
+        () async {
+      final base = await basicBuilder().write(dir, 'idx-gz');
+      final idxFile = File('$base.idx');
+      await File('$base.idx.gz').writeAsBytes(
+        GZipCodec().encode(await idxFile.readAsBytes()),
+      );
+      await idxFile.delete();
+
+      final reader = StarDictReader(base);
+      await reader.init();
+      expect(reader.words, ['Cherry', 'apple', 'banana']);
+      final entries = await reader.lookup('apple');
+      expect(entries.single.fields.first.text, 'a fruit with red skin');
+      await reader.close();
+    });
+
+    test('resolves synonyms from a .syn.gz file', () async {
+      final builder = basicBuilder()..addSynonym('fruit-fly', 1);
+      final base = await builder.write(dir, 'syn-gz');
+      final synFile = File('$base.syn');
+      await File('$base.syn.gz').writeAsBytes(
+        GZipCodec().encode(await synFile.readAsBytes()),
+      );
+      await synFile.delete();
+
+      final reader = StarDictReader(base);
+      await reader.init();
+      expect(reader.exist('fruit-fly'), isTrue);
+      final entries = await reader.lookup('fruit-fly');
+      expect(entries.single.headword, 'banana');
+      await reader.close();
+    });
+
+    test('prefers the plain index when both forms exist', () async {
+      final base = await basicBuilder().write(dir, 'idx-both');
+      await File('$base.idx.gz').writeAsBytes(
+        GZipCodec().encode(utf8.encode('garbage')),
+      );
+
+      final reader = StarDictReader(base);
+      await reader.init();
+      expect(reader.words, ['Cherry', 'apple', 'banana']);
+      await reader.close();
+    });
+  });
 }
