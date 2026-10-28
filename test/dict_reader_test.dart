@@ -16,9 +16,9 @@ void _writeUint32LE(BytesBuilder builder, int value) {
   builder.add(bytes.buffer.asUint8List());
 }
 
-List<int> _block(List<int> payload) {
+List<int> _block(List<int> payload, {int compressionMethod = 0}) {
   final builder = BytesBuilder();
-  _writeUint32LE(builder, 0);
+  _writeUint32LE(builder, compressionMethod);
   _writeUint32BE(builder, 0);
   builder.add(payload);
   return builder.toBytes();
@@ -45,6 +45,7 @@ Future<File> _createFixture(
   List<List<int>>? keyBytesOverride,
   List<List<int>>? valueBytesOverride,
   List<List<int>>? recordBlockPayloads,
+  int recordCompressionMethod = 0,
   String extension = '.mdx',
 }) async {
   final keyBytes = keyBytesOverride ??
@@ -71,8 +72,10 @@ Future<File> _createFixture(
   _writeUint32BE(keyInfo, keyBlock.length - 8);
 
   final recordPayload = values.expand((value) => value).toList();
-  final recordBlocks =
-      (recordBlockPayloads ?? [recordPayload]).map(_block).toList();
+  final recordBlocks = (recordBlockPayloads ?? [recordPayload])
+      .map((payload) =>
+          _block(payload, compressionMethod: recordCompressionMethod))
+      .toList();
   final recordBlockSize =
       recordBlocks.fold(0, (size, block) => size + block.length);
   final recordInfoSize = recordBlocks.length * 8;
@@ -128,6 +131,32 @@ void main() {
     final offset = await reader.locate(r'$beta');
     expect(offset, isNotNull);
     expect(await reader.readOneMdx(offset!), 'B');
+  });
+
+  test('names the compression method it cannot decode', () async {
+    final directory =
+        await Directory.systemTemp.createTemp('dict_reader_lzo_test_');
+    addTearDown(() => directory.delete(recursive: true));
+    // Method 1 is LZO. The payload stays raw on purpose: the reader has to
+    // name the method before it gets as far as decoding anything.
+    final file = await _createFixture(directory, recordCompressionMethod: 1);
+
+    final reader = DictReader(file.path);
+    await reader.initDict();
+    addTearDown(reader.close);
+
+    final offset = await reader.locate('alpha');
+    expect(offset, isNotNull);
+    await expectLater(
+      reader.readOneMdx(offset!),
+      throwsA(
+        isA<UnsupportedCompressionException>().having(
+          (error) => error.method,
+          'method',
+          1,
+        ),
+      ),
+    );
   });
 
   test('uses a sorted index for search and duplicate keys', () async {
