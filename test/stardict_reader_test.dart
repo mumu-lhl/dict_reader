@@ -363,4 +363,42 @@ void main() {
       await reader.close();
     });
   });
+
+  group('dictzipped synonym index', () {
+    // PyGlossary's `dictzip_syn` option writes the `.syn` index through
+    // dictzip, so a converted dictionary carries `.syn.dz` and no plain file.
+
+    test('resolves synonyms from a .syn.dz file', () async {
+      final builder = basicBuilder()..addSynonym('fruit-fly', 1);
+      final base = await builder.write(dir, 'syn-dz');
+      final synFile = File('$base.syn');
+      final syn = await synFile.readAsBytes();
+      // A synonym index is small, so dictzip stores it as a single chunk —
+      // the shape PyGlossary's `dictzip_syn` output takes.
+      await File('$base.syn.dz').writeAsBytes(
+        buildDictZip(syn, chunkLength: syn.length),
+      );
+      await synFile.delete();
+
+      final reader = StarDictReader(base);
+      await reader.init();
+      expect(reader.exist('fruit-fly'), isTrue);
+      final entries = await reader.lookup('fruit-fly');
+      expect(entries.single.headword, 'banana');
+      await reader.close();
+    });
+
+    test('prefers the plain synonym index when both forms exist', () async {
+      final builder = basicBuilder()..addSynonym('fruit-fly', 1);
+      final base = await builder.write(dir, 'syn-both');
+      await File('$base.syn.dz').writeAsBytes(
+        buildDictZip(utf8.encode('garbage'), chunkLength: 16),
+      );
+
+      final reader = StarDictReader(base);
+      await reader.init();
+      expect(reader.exist('fruit-fly'), isTrue);
+      await reader.close();
+    });
+  });
 }

@@ -175,10 +175,28 @@ Uint8List buildDictZip(Uint8List data, {required int chunkLength}) {
   for (final chunk in chunks) {
     out.add(chunk);
   }
-  // Trailer: crc32 (unchecked by the reader) + ISIZE.
-  out.add([0, 0, 0, 0]);
-  out.add((ByteData(4)..setUint32(0, data.length, Endian.little))
-      .buffer
-      .asUint8List());
+  // Trailer: crc32 + ISIZE. The reader ignores both, but a decoder that
+  // treats the file as a gzip member checks them, so they have to be right.
+  out.add(
+    (ByteData(4)..setUint32(0, _crc32(data), Endian.little))
+        .buffer
+        .asUint8List(),
+  );
+  out.add(
+    (ByteData(4)..setUint32(0, data.length & 0xFFFFFFFF, Endian.little))
+        .buffer
+        .asUint8List(),
+  );
   return out.takeBytes();
+}
+
+int _crc32(List<int> data) {
+  var crc = 0xFFFFFFFF;
+  for (final byte in data) {
+    crc ^= byte;
+    for (var i = 0; i < 8; i++) {
+      crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320 : crc >> 1;
+    }
+  }
+  return crc ^ 0xFFFFFFFF;
 }
