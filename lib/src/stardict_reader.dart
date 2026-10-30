@@ -180,9 +180,10 @@ class DictZipReader {
 /// Reader for StarDict dictionaries (`.ifo` / `.idx` / `.dict` files, with
 /// optional `.dict.dz` dictzip compression and a `.syn` synonym index).
 ///
-/// The index files may use the gzip-compressed form the format allows
-/// (`.idx.gz`, `.syn.gz`); they are decompressed transparently when the
-/// plain file is absent.
+/// The index files may use the compressed forms found in the wild: `.idx.gz`
+/// and `.syn.gz` from the gzip spelling the format allows, and `.syn.dz`,
+/// which PyGlossary writes when its `dictzip_syn` option is on. They are
+/// decompressed transparently when the plain file is absent.
 ///
 /// The reader is constructed with the dictionary's base path — the `.ifo`
 /// path without its extension, the same identity the companion files share:
@@ -674,15 +675,26 @@ class _ParsedStarDictIndex {
   });
 }
 
-/// Reads a StarDict index file, transparently decompressing the `.gz`
-/// form the format allows when the plain file is absent. Returns null
-/// when neither form exists.
+/// Reads a StarDict index file, transparently decompressing the `.gz` and
+/// `.dz` forms the format allows when the plain file is absent. Returns null
+/// when no form exists.
+///
+/// One decoder covers both. `.dz` is dictzip: a gzip member whose extra field
+/// describes independently compressed chunks, and those chunks are one deflate
+/// stream flushed at their boundaries, so inflating it front to back recovers
+/// the whole file. Only random access needs the chunk table, which is why
+/// `.dict.dz` reads through [DictZipReader] while an index — always wanted
+/// whole — does not.
 Uint8List? _readStarDictIndexFile(String path) {
   final plain = File(path);
   if (plain.existsSync()) return plain.readAsBytesSync();
-  final gzipped = File('$path.gz');
-  if (gzipped.existsSync()) {
-    return Uint8List.fromList(GZipCodec().decode(gzipped.readAsBytesSync()));
+  for (final suffix in const ['.gz', '.dz']) {
+    final compressed = File('$path$suffix');
+    if (compressed.existsSync()) {
+      return Uint8List.fromList(
+        GZipCodec().decode(compressed.readAsBytesSync()),
+      );
+    }
   }
   return null;
 }
@@ -699,7 +711,7 @@ _ParsedStarDictIndex _parseStarDictIndex(String basePath, int idxOffsetBits) {
   final idxBytes = _readStarDictIndexFile('$basePath.idx');
   if (idxBytes == null) {
     throw StateError(
-      'StarDict index (.idx/.idx.gz) not found for $basePath',
+      'StarDict index (.idx/.idx.gz/.idx.dz) not found for $basePath',
     );
   }
   final offsetWidth = idxOffsetBits ~/ 8;
