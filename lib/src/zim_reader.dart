@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
@@ -91,8 +92,15 @@ class ZimEntry implements DictArticle {
       mimeType == 'application/javascript' || mimeType == 'text/javascript';
 
   /// Reads the raw data bytes of this entry from its cluster blob.
+  ///
+  /// Redirect entries resolve to their target first (up to 10 hops, mirroring
+  /// [ZimReader.lookup]): a redirect carries no blob of its own, so reading
+  /// its cluster/blob fields would return an unrelated entry's bytes.
   @override
-  Future<Uint8List> readData() => reader.readBlob(clusterNumber, blobNumber);
+  Future<Uint8List> readData() async {
+    final target = await _resolveTarget();
+    return target.reader.readBlob(target.clusterNumber, target.blobNumber);
+  }
 
   /// Reads the entry data decoded as text.
   @override
@@ -104,8 +112,35 @@ class ZimEntry implements DictArticle {
   /// Opens a byte stream for reading this entry's blob, optionally constrained
   /// to the byte range [start] (inclusive) up to [end] (exclusive).
   @override
-  Future<Stream<List<int>>> openRead({int? start, int? end}) =>
-      reader.readBlobStream(clusterNumber, blobNumber, start: start, end: end);
+  Future<Stream<List<int>>> openRead({int? start, int? end}) async {
+    final target = await _resolveTarget();
+    return target.reader.readBlobStream(
+      target.clusterNumber,
+      target.blobNumber,
+      start: start,
+      end: end,
+    );
+  }
+
+  /// Follows the redirect chain starting at this entry, up to 10 hops.
+  /// Returns this entry unchanged when it is not a redirect. Throws a
+  /// [StateError] when the chain cannot be resolved to a content entry.
+  Future<ZimEntry> _resolveTarget() async {
+    var current = this;
+    var hops = 0;
+    while (current.isRedirect && current.redirectIndex != null && hops < 10) {
+      final nextIdx = current.redirectIndex!;
+      if (nextIdx < 0 || nextIdx >= current.reader._entryCount) break;
+      current = await current.reader.getEntry(nextIdx);
+      hops++;
+    }
+    if (current.isRedirect) {
+      throw StateError(
+        'Redirect chain for ${current.fullPath} could not be resolved',
+      );
+    }
+    return current;
+  }
 
   @override
   String toString() =>
@@ -148,6 +183,28 @@ class ZimReader implements DictionaryReader {
   RandomAccessFile? _file;
   bool _initialized = false;
   bool _metadataInitialized = false;
+
+  /// Serializes every operation that touches the shared [_file] handle.
+  /// Dart's [RandomAccessFile] throws `FileSystemException: An async operation
+  /// is currently pending` when a second `setPosition`/`read` starts while
+  /// another is in flight, and the handle's position is shared state — so
+  /// concurrent lookups and resource loads must never interleave on it. The
+  /// lock is a future chain: each holder awaits its predecessor and completes
+  /// its own link on release, so an action that throws still unblocks the
+  /// next waiter.
+  Future<void> _fileLock = Future.value();
+
+  Future<T> _withFileLock<T>(Future<T> Function() action) async {
+    final previous = _fileLock;
+    final gate = Completer<void>();
+    _fileLock = gate.future;
+    await previous;
+    try {
+      return await action();
+    } finally {
+      gate.complete();
+    }
+  }
 
   int _majorVersion = 0;
   int _minorVersion = 0;
@@ -246,6 +303,12 @@ class ZimReader implements DictionaryReader {
 
       _majorVersion = bd.getUint16(4, Endian.little);
       _minorVersion = bd.getUint16(6, Endian.little);
+      if (_majorVersion < 6) {
+        throw FormatException(
+          'Unsupported ZIM version $_majorVersion.$_minorVersion: '
+          'only 6.x archives are supported',
+        );
+      }
       _uuid = Uint8List.fromList(headerBytes.sublist(8, 24));
       _entryCount = bd.getUint32(24, Endian.little);
       _clusterCount = bd.getUint32(28, Endian.little);
@@ -275,9 +338,13 @@ class ZimReader implements DictionaryReader {
 
     await initMetadata();
 
+    // Copy the path to a local: the isolate closure must not capture `this`
+    // (the reader holds unsendable state such as the file-access lock future,
+    // and Isolate.run rejects the whole object graph when it does).
+    final filePath = path;
     final parsed = useIsolate
-        ? await Isolate.run(() => _parseZimIndex(path))
-        : _parseZimIndex(path);
+        ? await Isolate.run(() => _parseZimIndex(filePath))
+        : _parseZimIndex(filePath);
 
     _majorVersion = parsed.majorVersion;
     _minorVersion = parsed.minorVersion;
@@ -469,6 +536,12 @@ class ZimReader implements DictionaryReader {
     }
   }
 
+  /// Full-text search over article contents.
+  ///
+  /// This is a linear scan: it decompresses and reads every article until
+  /// [limit] matches are found, so it is far too slow for large archives.
+  /// For production full-text search, use the archive's embedded Xapian
+  /// index (see [extractFulltextDatabase]) instead of calling this.
   @override
   Future<List<ZimSearchResult>> searchFulltext(
     String query, {
@@ -486,7 +559,8 @@ class ZimReader implements DictionaryReader {
     // 1. Title match phase (highest relevance)
     for (var i = 0; i < _articleTitles.length && results.length < limit; i++) {
       final title = _articleTitles[i];
-      if (title.toLowerCase().contains(lowerQuery)) {
+      final normTitle = normalizeKey(title).toLowerCase();
+      if (normTitle.contains(lowerQuery)) {
         final entryIdx = _articleIndices[i];
         if (seen.add(entryIdx)) {
           final entry = await getEntry(entryIdx);
@@ -495,7 +569,7 @@ class ZimReader implements DictionaryReader {
           results.add(ZimSearchResult(
             article: entry,
             snippet: snippet,
-            score: title.toLowerCase() == lowerQuery ? 3.0 : 2.0,
+            score: normTitle == lowerQuery ? 3.0 : 2.0,
           ));
         }
       }
@@ -511,7 +585,7 @@ class ZimReader implements DictionaryReader {
 
         final entry = await getEntry(entryIdx);
         final text = await entry.readText();
-        if (text.toLowerCase().contains(lowerQuery)) {
+        if (normalizeKey(text).toLowerCase().contains(lowerQuery)) {
           seen.add(entryIdx);
           final snippet = extractSnippet(text, query);
           results.add(ZimSearchResult(
@@ -528,7 +602,9 @@ class ZimReader implements DictionaryReader {
   }
 
   /// Retrieves an entry by its direct entry index (0 to [entryCount] - 1).
-  Future<ZimEntry> getEntry(int index) async {
+  Future<ZimEntry> getEntry(int index) => _withFileLock(() => _getEntry(index));
+
+  Future<ZimEntry> _getEntry(int index) async {
     if (!_initialized || _file == null) {
       throw StateError('ZimReader.init() has not completed');
     }
@@ -626,7 +702,10 @@ class ZimReader implements DictionaryReader {
   }
 
   /// Reads a blob from a cluster, decompressing the cluster on demand and caching it.
-  Future<Uint8List> readBlob(int clusterNumber, int blobNumber) async {
+  Future<Uint8List> readBlob(int clusterNumber, int blobNumber) =>
+      _withFileLock(() => _readBlob(clusterNumber, blobNumber));
+
+  Future<Uint8List> _readBlob(int clusterNumber, int blobNumber) async {
     if (!_initialized || _file == null) {
       throw StateError('ZimReader.init() has not completed');
     }
@@ -650,6 +729,21 @@ class ZimReader implements DictionaryReader {
   /// For uncompressed clusters, this streams directly from the disk file without
   /// reading the entire cluster into memory.
   Future<Stream<List<int>>> readBlobStream(
+    int clusterNumber,
+    int blobNumber, {
+    int? start,
+    int? end,
+  }) =>
+      _withFileLock(
+        () => _readBlobStream(
+          clusterNumber,
+          blobNumber,
+          start: start,
+          end: end,
+        ),
+      );
+
+  Future<Stream<List<int>>> _readBlobStream(
     int clusterNumber,
     int blobNumber, {
     int? start,
@@ -867,16 +961,19 @@ class ZimReader implements DictionaryReader {
   }
 
   /// Closes the underlying file and releases memory caches.
+  ///
+  /// Waits for in-flight reads to finish (via the file lock) so a close can
+  /// never strand a concurrent read on a closed handle.
   @override
-  Future<void> close() async {
-    await _file?.close();
-    _file = null;
-    _clusterCache.clear();
-    _clusterLru.clear();
-    _clusterInfoCache.clear();
-    _initialized = false;
-    _metadataInitialized = false;
-  }
+  Future<void> close() => _withFileLock(() async {
+        await _file?.close();
+        _file = null;
+        _clusterCache.clear();
+        _clusterLru.clear();
+        _clusterInfoCache.clear();
+        _initialized = false;
+        _metadataInitialized = false;
+      });
 }
 
 /// Normalizes a path string (removes leading slashes, resolves `.` and `..`).
@@ -1128,6 +1225,12 @@ _ParsedZimIndex _parseZimIndex(String filePath) {
 
     final majorVersion = bd.getUint16(4, Endian.little);
     final minorVersion = bd.getUint16(6, Endian.little);
+    if (majorVersion < 6) {
+      throw FormatException(
+        'Unsupported ZIM version $majorVersion.$minorVersion: '
+        'only 6.x archives are supported',
+      );
+    }
     final uuid = Uint8List.fromList(headerBytes.sublist(8, 24));
     final entryCount = bd.getUint32(24, Endian.little);
     final clusterCount = bd.getUint32(28, Endian.little);
@@ -1238,14 +1341,19 @@ _ParsedZimIndex _parseZimIndex(String filePath) {
               ? mimeTypes[dirent.mimeTypeIndex]
               : '');
 
+      // Article content is text-like: plain text/html, or XHTML (the same
+      // definition [ZimEntry.isHtml] uses). The 'C' namespace holds both
+      // articles and media in new-namespace archives, so the MIME check is
+      // what keeps illustrations out of the word list there.
+      final isTextLike =
+          mime.startsWith('text/') || mime == 'application/xhtml+xml';
       final isArticle = dirent.namespace == 'A' ||
-          (dirent.namespace == 'C' &&
-              (mime.startsWith('text/') || dirent.isRedirect)) ||
+          (dirent.namespace == 'C' && (isTextLike || dirent.isRedirect)) ||
           (dirent.namespace != 'I' &&
               dirent.namespace != '-' &&
               dirent.namespace != 'W' &&
               dirent.namespace != 'X' &&
-              (mime.startsWith('text/') || dirent.isRedirect));
+              (isTextLike || dirent.isRedirect));
 
       if (isArticle) {
         articleIndices.add(i);

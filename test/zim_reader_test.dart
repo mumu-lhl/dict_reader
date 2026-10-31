@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:dict_reader/dict_reader.dart';
@@ -316,6 +317,154 @@ void main() {
       await reader.close();
 
       expect(() => reader.lookup('apple'), throwsA(isA<StateError>()));
+    });
+  });
+
+  group('Concurrent reads', () {
+    test('parallel getEntry/readData calls return the right entries', () async {
+      const count = 24;
+      final builder = ZimFixtureBuilder()..addMetadata('Title', 'Race probe');
+      final expectedBytes = <String, List<int>>{};
+      for (var i = 0; i < count; i++) {
+        // Long titles force the 2048-byte dirent fallback read, widening the
+        // window in which concurrent reads used to interleave on one handle.
+        final title = 'Article ${i}_${'T' * 300}';
+        final body = 'body-$i-${'x' * (100 + i * 37)}';
+        builder.addArticle('entry_$i', title, '<p>$body</p>');
+        final data =
+            List<int>.generate(200 + i * 53, (j) => (i * 31 + j) & 0xff);
+        builder.addResource('res_$i.bin', data, 'application/octet-stream');
+        expectedBytes['res_$i.bin'] = data;
+      }
+      final zimPath = await builder.write(
+        dir,
+        'race',
+        compression: ZimCompression.zip,
+        blobsPerCluster: 1,
+      );
+      final reader = ZimReader(zimPath);
+      await reader.init();
+
+      for (var round = 0; round < 2; round++) {
+        final results = await Future.wait(
+          List.generate(count, (i) => reader.readDataByPath('res_$i.bin')),
+        );
+        for (var i = 0; i < count; i++) {
+          expect(results[i], expectedBytes['res_$i.bin']);
+        }
+
+        final entries = await Future.wait(
+          List.generate(count, (i) => reader.getEntry(i)),
+        );
+        final sequential = <ZimEntry>[];
+        for (var i = 0; i < count; i++) {
+          sequential.add(await reader.getEntry(i));
+        }
+        for (var i = 0; i < count; i++) {
+          expect(entries[i].path, sequential[i].path);
+          expect(entries[i].title, sequential[i].title);
+          expect(entries[i].mimeType, sequential[i].mimeType);
+        }
+      }
+      await reader.close();
+    });
+  });
+
+  group('New-namespace (C) archives', () {
+    test('XHTML articles in C namespace are indexed as words', () async {
+      final builder = ZimFixtureBuilder()
+        ..addMetadata('Title', 'C-namespace probe')
+        ..addArticle('Apple', 'Apple', '<p>apple</p>', namespace: 'C')
+        ..addResource(
+          'Apple.jpg',
+          List<int>.generate(64, (i) => i),
+          'image/jpeg',
+          namespace: 'C',
+        )
+        ..addArticle('Banana', 'Banana', '<p>banana</p>', namespace: 'C')
+        ..addResource(
+          'xhtml-doc',
+          utf8.encode('<html><body>xhtml</body></html>'),
+          'application/xhtml+xml',
+          namespace: 'C',
+          title: 'Xhtml Article',
+        );
+      final zimPath = await builder.write(dir, 'c_namespace');
+      final reader = ZimReader(zimPath);
+      await reader.init();
+
+      expect(reader.words, containsAll(['Apple', 'Banana', 'Xhtml Article']));
+      expect(reader.words, isNot(contains('Apple.jpg')));
+      expect(reader.wordCount, 3);
+
+      final hits = await reader.lookup('Xhtml Article');
+      expect(hits, hasLength(1));
+      expect(hits.single.isHtml, isTrue);
+      expect(reader.search('xht'), contains('Xhtml Article'));
+
+      await reader.close();
+    });
+  });
+
+  group('Redirect data reads', () {
+    test('readData on a redirect entry returns the target content', () async {
+      final zimPath = await basicBuilder().write(dir, 'redir_data');
+      final reader = ZimReader(zimPath);
+      await reader.init();
+
+      final redir = await reader.getEntryByPath('apples');
+      expect(redir, isNotNull);
+      expect(redir!.isRedirect, isTrue);
+      expect(await redir.readText(), contains('A red fruit.'));
+
+      final redirOnly = await reader.lookup('apples', followRedirects: false);
+      expect(await redirOnly.single.readText(), contains('A red fruit.'));
+
+      final bytes = await (await redir.openRead())
+          .fold(<int>[], (acc, chunk) => acc..addAll(chunk));
+      expect(utf8.decode(bytes), contains('A red fruit.'));
+
+      await reader.close();
+    });
+  });
+
+  group('Format version', () {
+    test('rejects pre-6.0 archives', () async {
+      final zimPath = await basicBuilder().write(
+        dir,
+        'old_version',
+        majorVersion: 5,
+      );
+      final reader = ZimReader(zimPath);
+      expect(() => reader.init(), throwsA(isA<FormatException>()));
+    });
+  });
+
+  group('Full-text search', () {
+    test('matches an NFC query against NFD article text', () async {
+      const nfdWord = 'cafe\u0301';
+      const nfcWord = 'caf\u00E9';
+      final builder = ZimFixtureBuilder()
+        ..addArticle(
+          nfdWord,
+          nfdWord,
+          '<html><body>un cafe\u0301 bien fort</body></html>',
+        )
+        ..addArticle(
+          'plain',
+          'plain',
+          '<html><body>un cafe\u0301 ordinaire</body></html>',
+        );
+      final zimPath = await builder.write(dir, 'fulltext_nfc');
+      final reader = ZimReader(zimPath);
+      await reader.init();
+
+      final results = await reader.searchFulltext(nfcWord);
+      expect(
+        results.map((r) => r.article.headword),
+        containsAll([nfdWord, 'plain']),
+      );
+      await reader.close();
     });
   });
 }

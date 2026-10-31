@@ -288,6 +288,11 @@ DeserializedZimCidx deserializeZimCidx(Uint8List bytes, File targetFile) {
   pos += 2;
   final minorVersion = bd.getUint16(pos, Endian.big);
   pos += 2;
+  if (majorVersion < 6) {
+    throw const FormatException(
+      'Stale ZIM .cidx: unsupported ZIM version (only 6.x)',
+    );
+  }
   final uuid = Uint8List.fromList(bytes.sublist(pos, pos + 16));
   pos += 16;
   final entryCount = bd.getUint32(pos, Endian.big);
