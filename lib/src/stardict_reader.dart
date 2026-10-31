@@ -67,6 +67,16 @@ class StarDictEntry implements DictArticle {
     }
     return Uint8List.fromList(utf8.encode(content));
   }
+
+  @override
+  Future<Stream<List<int>>> openRead({int? start, int? end}) async {
+    final bytes = await readData();
+    final length = bytes.length;
+    final s = (start ?? 0).clamp(0, length);
+    final e = (end ?? length).clamp(s, length);
+    if (s >= e) return Stream.value(Uint8List(0));
+    return Stream.value(Uint8List.sublistView(bytes, s, e));
+  }
 }
 
 /// Whether a StarDict type code holds a length-prefixed binary blob
@@ -253,6 +263,22 @@ class StarDictReader implements DictionaryReader {
   @override
   Future<Uint8List?> getResource(String path) async => null;
 
+  @override
+  Future<Stream<List<int>>?> getResourceStream(
+    String path, {
+    int? start,
+    int? end,
+  }) async =>
+      null;
+
+  @override
+  Future<Uint8List> exportCidx() =>
+      throw UnsupportedError('exportCidx is not supported for StarDict');
+
+  @override
+  Future<void> importCidx(Uint8List bytes) =>
+      throw UnsupportedError('importCidx is not supported for StarDict');
+
   // On-disk index state, built by init(). The `.idx` (and `.syn`) files
   // are themselves sorted indexes, so they are read whole into memory
   // and binary-searched in place: no headword strings, locations, or
@@ -281,6 +307,7 @@ class StarDictReader implements DictionaryReader {
   /// All headwords, in sorted index order. Decoded lazily on first
   /// access and cached; prefer [wordAt] for single lookups so a large
   /// dictionary is not decoded in full.
+  @override
   List<String> get words {
     var cache = _wordsCache;
     if (cache == null) {
@@ -291,6 +318,7 @@ class StarDictReader implements DictionaryReader {
   }
 
   /// The headword of the [index]-th `.idx` entry, decoded on demand.
+  @override
   String wordAt(int index) => _idxWordAt(index);
 
   RandomAccessFile? _dictFile;
@@ -618,6 +646,55 @@ class StarDictReader implements DictionaryReader {
       if (!normalizeKey(word).toLowerCase().startsWith(lowerQuery)) break;
       results.add(word);
     }
+    return results;
+  }
+
+  @override
+  Future<List<DictSearchResult>> searchFulltext(
+    String query, {
+    int limit = 20,
+  }) async {
+    if (query.isEmpty) return const [];
+    final lowerQuery = normalizeKey(query).toLowerCase();
+    final results = <DictSearchResult>[];
+    final seen = <String>{};
+
+    for (var i = 0; i < wordCount && results.length < limit; i++) {
+      final word = wordAt(i);
+      if (word.toLowerCase().contains(lowerQuery)) {
+        if (seen.add(word)) {
+          final entries = await lookup(word);
+          if (entries.isNotEmpty) {
+            final text = await entries.first.readText();
+            results.add(DictSearchResult(
+              article: entries.first,
+              snippet: extractSnippet(text, query),
+              score: word.toLowerCase() == lowerQuery ? 3.0 : 2.0,
+            ));
+          }
+        }
+      }
+    }
+
+    if (results.length < limit) {
+      for (var i = 0; i < wordCount && results.length < limit; i++) {
+        final word = wordAt(i);
+        if (seen.contains(word)) continue;
+        final entries = await lookup(word);
+        if (entries.isEmpty) continue;
+        final text = await entries.first.readText();
+        if (text.toLowerCase().contains(lowerQuery)) {
+          seen.add(word);
+          results.add(DictSearchResult(
+            article: entries.first,
+            snippet: extractSnippet(text, query),
+            score: 1.0,
+          ));
+        }
+      }
+    }
+
+    results.sort((a, b) => b.score.compareTo(a.score));
     return results;
   }
 

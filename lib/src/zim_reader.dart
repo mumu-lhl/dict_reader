@@ -8,6 +8,9 @@ import 'package:archive/archive.dart';
 import 'dictionary_reader.dart';
 import 'exceptions.dart';
 import 'normalize.dart';
+import 'zim_cidx.dart';
+
+export 'zim_cidx.dart';
 
 /// A single entry inside a ZIM archive (article, image, redirect, metadata, etc.).
 class ZimEntry implements DictArticle {
@@ -98,9 +101,26 @@ class ZimEntry implements DictArticle {
     return encoding.decode(bytes);
   }
 
+  /// Opens a byte stream for reading this entry's blob, optionally constrained
+  /// to the byte range [start] (inclusive) up to [end] (exclusive).
+  @override
+  Future<Stream<List<int>>> openRead({int? start, int? end}) =>
+      reader.readBlobStream(clusterNumber, blobNumber, start: start, end: end);
+
   @override
   String toString() =>
       'ZimEntry($fullPath, title: "$title", mime: $mimeType, redirect: $isRedirect)';
+}
+
+/// A search result returned by [ZimReader.searchFulltext].
+class ZimSearchResult extends DictSearchResult {
+  const ZimSearchResult({
+    required super.article,
+    required super.snippet,
+    super.score = 1.0,
+  });
+
+  ZimEntry get zimEntry => article as ZimEntry;
 }
 
 /// Reader for ZIM archives (openZIM / Kiwix format).
@@ -199,9 +219,11 @@ class ZimReader implements DictionaryReader {
   int get wordCount => _articleIndices.length;
 
   /// All article headwords in sorted order.
+  @override
   List<String> get words => List.unmodifiable(_articleTitles);
 
   /// Returns the headword of the [index]-th article.
+  @override
   String wordAt(int index) => _articleTitles[index];
 
   /// Reads file header and MIME list without loading the full index.
@@ -415,6 +437,96 @@ class ZimReader implements DictionaryReader {
     return results;
   }
 
+  /// Whether this archive contains an embedded Xapian full-text search index (in namespace 'X').
+  bool get hasFulltextIndex {
+    return _pathToEntryIndex.containsKey('X/fulltext/xapian') ||
+        _pathToEntryIndex.keys.any((k) => k.startsWith('X/fulltext/xapian'));
+  }
+
+  /// Returns all entries located in the index/search namespace 'X'.
+  List<String> get fulltextIndexPaths {
+    return _pathToEntryIndex.keys.where((k) => k.startsWith('X/')).toList();
+  }
+
+  /// Extracts the embedded Xapian full-text database files into [targetDir].
+  Future<void> extractFulltextDatabase(Directory targetDir) async {
+    if (!targetDir.existsSync()) {
+      await targetDir.create(recursive: true);
+    }
+    for (final e in _pathToEntryIndex.entries) {
+      if (e.key.startsWith('X/fulltext/xapian')) {
+        final rel = e.key.substring('X/fulltext/xapian'.length);
+        final cleanRel = rel.startsWith('/') ? rel.substring(1) : rel;
+        final targetPath = cleanRel.isEmpty
+            ? '${targetDir.path}/fulltext.xapian'
+            : '${targetDir.path}/$cleanRel';
+        final entry = await getEntry(e.value);
+        final data = await entry.readData();
+        final outFile = File(targetPath);
+        await outFile.parent.create(recursive: true);
+        await outFile.writeAsBytes(data);
+      }
+    }
+  }
+
+  @override
+  Future<List<ZimSearchResult>> searchFulltext(
+    String query, {
+    int limit = 20,
+  }) async {
+    if (!_initialized) {
+      throw StateError('ZimReader.init() has not completed');
+    }
+    if (query.isEmpty) return const [];
+
+    final lowerQuery = normalizeKey(query).toLowerCase();
+    final results = <ZimSearchResult>[];
+    final seen = <int>{};
+
+    // 1. Title match phase (highest relevance)
+    for (var i = 0; i < _articleTitles.length && results.length < limit; i++) {
+      final title = _articleTitles[i];
+      if (title.toLowerCase().contains(lowerQuery)) {
+        final entryIdx = _articleIndices[i];
+        if (seen.add(entryIdx)) {
+          final entry = await getEntry(entryIdx);
+          final text = await entry.readText();
+          final snippet = extractSnippet(text, query);
+          results.add(ZimSearchResult(
+            article: entry,
+            snippet: snippet,
+            score: title.toLowerCase() == lowerQuery ? 3.0 : 2.0,
+          ));
+        }
+      }
+    }
+
+    // 2. Article content scan phase (for remaining slots)
+    if (results.length < limit) {
+      for (var i = 0;
+          i < _articleIndices.length && results.length < limit;
+          i++) {
+        final entryIdx = _articleIndices[i];
+        if (seen.contains(entryIdx)) continue;
+
+        final entry = await getEntry(entryIdx);
+        final text = await entry.readText();
+        if (text.toLowerCase().contains(lowerQuery)) {
+          seen.add(entryIdx);
+          final snippet = extractSnippet(text, query);
+          results.add(ZimSearchResult(
+            article: entry,
+            snippet: snippet,
+            score: 1.0,
+          ));
+        }
+      }
+    }
+
+    results.sort((a, b) => b.score.compareTo(a.score));
+    return results;
+  }
+
   /// Retrieves an entry by its direct entry index (0 to [entryCount] - 1).
   Future<ZimEntry> getEntry(int index) async {
     if (!_initialized || _file == null) {
@@ -530,6 +642,174 @@ class ZimReader implements DictionaryReader {
     final decompressed = await _getDecompressedCluster(clusterNumber);
     final isExtended = _isClusterExtended(clusterNumber);
     return _extractBlob(decompressed, blobNumber, isExtended);
+  }
+
+  /// Opens a byte stream for reading the blob at [clusterNumber], [blobNumber],
+  /// optionally constrained to the range [start] (inclusive) up to [end] (exclusive).
+  ///
+  /// For uncompressed clusters, this streams directly from the disk file without
+  /// reading the entire cluster into memory.
+  Future<Stream<List<int>>> readBlobStream(
+    int clusterNumber,
+    int blobNumber, {
+    int? start,
+    int? end,
+  }) async {
+    if (!_initialized || _file == null) {
+      throw StateError('ZimReader.init() has not completed');
+    }
+    if (clusterNumber < 0 || clusterNumber >= _clusterCount) {
+      throw RangeError.range(
+        clusterNumber,
+        0,
+        _clusterCount - 1,
+        'clusterNumber',
+      );
+    }
+
+    final clusterOffset = _clusterOffsets![clusterNumber];
+    await _file!.setPosition(clusterOffset);
+    final infoBytes = await _file!.read(1);
+    if (infoBytes.isEmpty) {
+      throw FormatException('Empty cluster $clusterNumber');
+    }
+    final infoByte = infoBytes[0];
+    final compType = infoByte & 0x0f;
+    final isExtended = (infoByte & 0x10) != 0;
+
+    if (compType <= 1) {
+      // Uncompressed cluster! Stream directly from disk.
+      final offsetSize = isExtended ? 8 : 4;
+      await _file!.setPosition(clusterOffset + 1);
+      final offset0Bytes = await _file!.read(offsetSize);
+      final bd = ByteData.sublistView(offset0Bytes);
+      final offset0 = isExtended
+          ? bd.getUint64(0, Endian.little)
+          : bd.getUint32(0, Endian.little);
+      final totalOffsets = offset0 ~/ offsetSize;
+      final totalBlobs = totalOffsets - 1;
+      if (blobNumber < 0 || blobNumber >= totalBlobs) {
+        throw RangeError.range(blobNumber, 0, totalBlobs - 1, 'blobNumber');
+      }
+
+      await _file!.setPosition(clusterOffset + 1 + blobNumber * offsetSize);
+      final pairBytes = await _file!.read(offsetSize * 2);
+      final pairBd = ByteData.sublistView(pairBytes);
+      final blobStart = isExtended
+          ? pairBd.getUint64(0, Endian.little)
+          : pairBd.getUint32(0, Endian.little);
+      final blobEnd = isExtended
+          ? pairBd.getUint64(offsetSize, Endian.little)
+          : pairBd.getUint32(offsetSize, Endian.little);
+
+      final blobLength = blobEnd - blobStart;
+      final s = (start ?? 0).clamp(0, blobLength);
+      final e = (end ?? blobLength).clamp(s, blobLength);
+      if (s >= e) return Stream.value(Uint8List(0));
+
+      final diskStart = clusterOffset + 1 + blobStart + s;
+      final diskEnd = clusterOffset + 1 + blobStart + e;
+      return File(path).openRead(diskStart, diskEnd);
+    } else {
+      final decompressed = await _getDecompressedCluster(clusterNumber);
+      final blob = _extractBlob(decompressed, blobNumber, isExtended);
+      final length = blob.length;
+      final s = (start ?? 0).clamp(0, length);
+      final e = (end ?? length).clamp(s, length);
+      if (s >= e) return Stream.value(Uint8List(0));
+      return Stream.value(Uint8List.sublistView(blob, s, e));
+    }
+  }
+
+  @override
+  Future<Stream<List<int>>?> getResourceStream(
+    String path, {
+    int? start,
+    int? end,
+  }) async {
+    final entry = await getEntryByPath(path);
+    if (entry == null) return null;
+    return entry.openRead(start: start, end: end);
+  }
+
+  @override
+  Future<Uint8List> exportCidx() async {
+    if (!_initialized) {
+      throw StateError('ZimReader.init() has not completed');
+    }
+    final file = File(path);
+    final stat = await file.stat();
+    return serializeZimCidx(
+      filePath: path,
+      fileSize: stat.size,
+      fileModified: stat.modified.microsecondsSinceEpoch,
+      majorVersion: _majorVersion,
+      minorVersion: _minorVersion,
+      uuid: _uuid,
+      entryCount: _entryCount,
+      clusterCount: _clusterCount,
+      pathPtrPos: _pathPtrPos,
+      titlePtrPos: _titlePtrPos,
+      clusterPtrPos: _clusterPtrPos,
+      mimeListPos: _mimeListPos,
+      mainPage: _mainPage,
+      layoutPage: _layoutPage,
+      checksumPos: _checksumPos,
+      mimeTypes: _mimeTypes,
+      metadata: _metadata,
+      clusterOffsets: _clusterOffsets!,
+      pathPointers: _pathPointers!,
+      titlePointers: _titlePointers,
+      articleIndices: _articleIndices,
+      articleTitles: _articleTitles,
+      searchOrder: _searchOrder,
+      pathToEntryIndex: _pathToEntryIndex,
+    );
+  }
+
+  @override
+  Future<void> importCidx(Uint8List bytes) async {
+    final targetFile = File(path);
+    final deserialized = deserializeZimCidx(bytes, targetFile);
+
+    _majorVersion = deserialized.majorVersion;
+    _minorVersion = deserialized.minorVersion;
+    _uuid = deserialized.uuid;
+    _entryCount = deserialized.entryCount;
+    _clusterCount = deserialized.clusterCount;
+    _pathPtrPos = deserialized.pathPtrPos;
+    _titlePtrPos = deserialized.titlePtrPos;
+    _clusterPtrPos = deserialized.clusterPtrPos;
+    _mimeListPos = deserialized.mimeListPos;
+    _mainPage = deserialized.mainPage;
+    _layoutPage = deserialized.layoutPage;
+    _checksumPos = deserialized.checksumPos;
+    _mimeTypes = deserialized.mimeTypes;
+    _metadata = deserialized.metadata;
+    _clusterOffsets = deserialized.clusterOffsets;
+    _pathPointers = deserialized.pathPointers;
+    _titlePointers = deserialized.titlePointers;
+    _articleIndices = deserialized.articleIndices;
+    _articleTitles = deserialized.articleTitles;
+    _searchOrder = deserialized.searchOrder;
+    _pathToEntryIndex = deserialized.pathToEntryIndex;
+
+    _titleToIndex.clear();
+    _normalizedTitles.clear();
+    _lowerTitles.clear();
+    for (var i = 0; i < _articleTitles.length; i++) {
+      final title = _articleTitles[i];
+      final entryIdx = _articleIndices[i];
+      _titleToIndex.putIfAbsent(title, () => entryIdx);
+      final norm = normalizeKey(title);
+      _normalizedTitles.putIfAbsent(norm, () => entryIdx);
+      _lowerTitles.putIfAbsent(title.toLowerCase(), () => entryIdx);
+      _lowerTitles.putIfAbsent(norm.toLowerCase(), () => entryIdx);
+    }
+
+    _file = await targetFile.open(mode: FileMode.read);
+    _initialized = true;
+    _metadataInitialized = true;
   }
 
   bool _isClusterExtended(int clusterNumber) {

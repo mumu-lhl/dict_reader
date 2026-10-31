@@ -260,4 +260,188 @@ void main() {
       await reader.close();
     });
   });
+
+  group('Streaming and Range Resource Access', () {
+    test('streams resources and handles range requests in ZIM and MDD',
+        () async {
+      final builder = ZimFixtureBuilder()
+        ..addMetadata('Title', 'Stream Test')
+        ..addResource('media/audio.bin', [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            'application/octet-stream');
+      final zimPath = await builder.write(dir, 'stream_zim',
+          compression: ZimCompression.none);
+
+      final reader = await DictionaryReader.open(zimPath);
+      final stream =
+          await reader.getResourceStream('media/audio.bin', start: 2, end: 6);
+      expect(stream, isNotNull);
+      final chunks = await stream!.toList();
+      final bytes = chunks.expand((c) => c).toList();
+      expect(bytes, [2, 3, 4, 5]);
+
+      await reader.close();
+    });
+
+    test('openRead on DictArticle returns range bytes', () async {
+      await _createMdxFixture(dir, 'mdx_range');
+      final reader = await DictionaryReader.open('${dir.path}/mdx_range.mdx');
+      final articles = await reader.lookup('apple');
+      final article = articles.single;
+
+      final fullStream = await article.openRead();
+      final fullBytes = (await fullStream.toList()).expand((c) => c).toList();
+      expect(utf8.decode(fullBytes), contains('<b>apple</b>'));
+
+      final sliceStream = await article.openRead(start: 3, end: 8);
+      final sliceBytes = (await sliceStream.toList()).expand((c) => c).toList();
+      expect(sliceBytes, fullBytes.sublist(3, 8));
+
+      await reader.close();
+    });
+  });
+
+  group('Full-text search', () {
+    test('searchFulltext finds content across MDX, StarDict, and ZIM',
+        () async {
+      // 1. MDX
+      await _createMdxFixture(dir, 'mdx_ft');
+      final mdxReader = await DictionaryReader.open('${dir.path}/mdx_ft.mdx');
+      final mdxResults = await mdxReader.searchFulltext('fruit');
+      expect(mdxResults, hasLength(2));
+      expect(mdxResults.first.snippet, contains('fruit'));
+      await mdxReader.close();
+
+      // 2. StarDict
+      final sdBuilder = StarDictFixtureBuilder()
+        ..add('apple', [('m', 'a round fruit with red or green skin')])
+        ..add('banana', [('m', 'a curved yellow fruit')]);
+      final sdBase = await sdBuilder.write(dir, 'sd_ft');
+      final sdReader = await DictionaryReader.open('$sdBase.ifo');
+      final sdResults = await sdReader.searchFulltext('curved');
+      expect(sdResults, hasLength(1));
+      expect(sdResults.single.article.headword, 'banana');
+      expect(sdResults.single.snippet, contains('curved'));
+      await sdReader.close();
+
+      // 3. ZIM
+      final zimBuilder = ZimFixtureBuilder()
+        ..addArticle(
+            'earth', 'Earth', '<p>Earth is the third planet from the Sun.</p>')
+        ..addArticle(
+            'mars', 'Mars', '<p>Mars is the fourth planet from the Sun.</p>');
+      final zimPath = await zimBuilder.write(dir, 'zim_ft');
+      final zimReader = await DictionaryReader.open(zimPath);
+      final zimResults = await zimReader.searchFulltext('planet');
+      expect(zimResults, hasLength(2));
+      expect(zimResults.first.snippet, contains('planet'));
+      await zimReader.close();
+    });
+  });
+
+  group('ZIM .cidx export and import', () {
+    test('exportCidx and importCidx round-trip matches the scanned reader',
+        () async {
+      final builder = ZimFixtureBuilder()
+        ..addMetadata('Title', 'CIDX Zim Test')
+        ..addArticle('cat', 'Cat', '<p>Feline animal</p>')
+        ..addArticle('dog', 'Dog', '<p>Canine animal</p>')
+        ..addRedirect('kitty', 'Kitty', 'cat');
+      final zimPath = await builder.write(dir, 'cidx_test');
+
+      final scanned = ZimReader(zimPath);
+      await scanned.init();
+
+      final cidxBytes = await scanned.exportCidx();
+      expect(cidxBytes, isNotEmpty);
+
+      // Open a fresh reader and import the cidx
+      final imported = ZimReader(zimPath);
+      await imported.importCidx(cidxBytes);
+
+      expect(imported.title, scanned.title);
+      expect(imported.wordCount, scanned.wordCount);
+      expect(imported.words, scanned.words);
+      expect(imported.exist('cat'), isTrue);
+      expect(imported.exist('kitty'), isTrue);
+      expect(imported.exist('dog'), isTrue);
+      expect(imported.exist('wolf'), isFalse);
+
+      final cat = await imported.lookup('cat');
+      expect(await cat.single.readText(), contains('Feline'));
+
+      final redirect = await imported.lookup('kitty');
+      expect(await redirect.single.readText(), contains('Feline'));
+
+      final hits = imported.search('c');
+      expect(hits, ['Cat']);
+
+      await scanned.close();
+      await imported.close();
+    });
+
+    test('rejects stale .cidx if file modified or corrupted', () async {
+      final builder = ZimFixtureBuilder()
+        ..addMetadata('Title', 'Stale Test')
+        ..addArticle('one', 'One', '1');
+      final zimPath = await builder.write(dir, 'stale_test');
+
+      final reader = ZimReader(zimPath);
+      await reader.init();
+      final cidxBytes = await reader.exportCidx();
+      await reader.close();
+
+      // Corrupt magic
+      cidxBytes[0] = 0xff;
+      final badReader = ZimReader(zimPath);
+      expect(
+        () async => badReader.importCidx(cidxBytes),
+        throwsA(isA<FormatException>()),
+      );
+    });
+  });
+
+  group('ZIM Xapian full-text index inspection and extraction', () {
+    test('detects Xapian index and extracts database files', () async {
+      final builder = ZimFixtureBuilder()
+        ..addMetadata('Title', 'Xapian Test')
+        ..addArticle('solar_system', 'Solar System', '<p>Planets and stars</p>')
+        ..addResource(
+          'fulltext/xapian/iamglass',
+          utf8.encode('iamglass\n'),
+          'application/octet-stream+xapian',
+          namespace: 'X',
+        )
+        ..addResource(
+          'fulltext/xapian/postlist.glass',
+          utf8.encode('postlist data'),
+          'application/octet-stream+xapian',
+          namespace: 'X',
+        );
+      final zimPath = await builder.write(dir, 'xapian_zim');
+
+      final reader = ZimReader(zimPath);
+      await reader.init();
+
+      expect(reader.hasFulltextIndex, isTrue);
+      expect(reader.fulltextIndexPaths, contains('X/fulltext/xapian/iamglass'));
+      expect(reader.fulltextIndexPaths,
+          contains('X/fulltext/xapian/postlist.glass'));
+
+      final extractDir = Directory('${dir.path}/extracted_xapian');
+      await reader.extractFulltextDatabase(extractDir);
+
+      expect(File('${extractDir.path}/iamglass').existsSync(), isTrue);
+      expect(
+        await File('${extractDir.path}/iamglass').readAsString(),
+        'iamglass\n',
+      );
+      expect(File('${extractDir.path}/postlist.glass').existsSync(), isTrue);
+      expect(
+        await File('${extractDir.path}/postlist.glass').readAsString(),
+        'postlist data',
+      );
+
+      await reader.close();
+    });
+  });
 }

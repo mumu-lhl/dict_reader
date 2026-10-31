@@ -3,102 +3,26 @@ import "dart:io";
 import "dart:isolate";
 import "dart:typed_data";
 
-import "package:blockchain_utils/crypto/crypto/hash/hash.dart";
 import "package:charset/charset.dart";
 import "package:html_unescape/html_unescape.dart";
 
 import "cidx.dart";
 import "dictionary_reader.dart";
 import "exceptions.dart";
+import "mdx_binary_helpers.dart";
+import "mdx_crypto.dart";
+import "mdx_record.dart";
 import "normalize.dart";
+
+export "mdx_record.dart";
 
 const _utf16Decoder = Utf16Decoder();
 
-Uint8List _fastDecrypt(Uint8List data, Uint8List key) {
-  // XOR decryption
-  final b = data;
-  final keyLength = key.length;
-  int previous = 0x36;
-
-  for (int i = 0; i < b.length; i++) {
-    int t = (b[i] >> 4 | b[i] << 4) & 0xff;
-    t = t ^ previous ^ (i & 0xff) ^ key[i % keyLength];
-    previous = b[i];
-    b[i] = t;
-  }
-
-  return b;
-}
-
-int _readByte(List<int> buffer, int byteWidth, [int start = 0]) {
-  if (byteWidth == 1) {
-    return buffer[start];
-  }
-  return (buffer[start] << 8) | buffer[start + 1];
-}
-
-int _readNumber(List<int> buffer, int numberWidth, [int start = 0]) {
-  var value = 0;
-  for (var i = 0; i < numberWidth; i++) {
-    value = (value << 8) | buffer[start + i];
-  }
-  return value;
-}
-
-List<int> _sliceBytes(List<int> data, int start, int end) {
-  if (data is Uint8List) {
-    return Uint8List.sublistView(data, start, end);
-  }
-  return data.sublist(start, end);
-}
-
-int _findByteTerminator(Uint8List bytes, int start) {
-  var index = start;
-  while (index < bytes.length && bytes[index] != 0) {
-    index++;
-  }
-  return index;
-}
-
-int _findUtf16Terminator(Uint8List bytes, int start) {
-  var index = start;
-  while (index + 1 < bytes.length &&
-      (bytes[index] != 0 || bytes[index + 1] != 0)) {
-    index += 2;
-  }
-  return index;
-}
-
-/// A single MDX/MDD dictionary entry implementing [DictArticle].
-class MdxEntry implements DictArticle {
-  final RecordOffsetInfo offsetInfo;
-  final DictReader reader;
-
-  const MdxEntry({required this.offsetInfo, required this.reader});
-
-  @override
-  String get headword => offsetInfo.keyText;
-
-  @override
-  String get mimeType =>
-      reader.isMdx ? 'text/html' : 'application/octet-stream';
-
-  @override
-  String get format => reader.isMdx ? 'mdx' : 'mdd';
-
-  @override
-  dynamic get raw => offsetInfo;
-
-  @override
-  Future<String> readText() => reader.readOneMdx(offsetInfo);
-
-  @override
-  Future<Uint8List> readData() async =>
-      Uint8List.fromList(await reader.readRecordData(offsetInfo));
-
-  @override
-  String toString() => 'MdxEntry($headword, format: $format)';
-}
+const _readByte = readByte;
+const _readNumber = readNumber;
+const _sliceBytes = sliceBytes;
+const _findByteTerminator = findByteTerminator;
+const _findUtf16Terminator = findUtf16Terminator;
 
 /// Reading MDX/MDD files.
 class DictReader implements DictionaryReader {
@@ -113,6 +37,77 @@ class DictReader implements DictionaryReader {
 
   @override
   int get wordCount => numEntries;
+
+  @override
+  List<String> get words {
+    if (_cidxLoaded) {
+      return [
+        for (var i = 0; i < _cidxEntryOffsets!.length; i++)
+          _cidxRawKey(_cidxEntry(i)),
+      ];
+    }
+    return [for (final item in _keyList) item.$2];
+  }
+
+  @override
+  String wordAt(int index) {
+    if (_cidxLoaded) {
+      return _cidxRawKey(_cidxEntry(index));
+    }
+    return _keyList[index].$2;
+  }
+
+  @override
+  Future<List<DictSearchResult>> searchFulltext(
+    String query, {
+    int limit = 20,
+  }) async {
+    if (query.isEmpty) return const [];
+    final lowerQuery = normalizeKey(query).toLowerCase();
+    final results = <DictSearchResult>[];
+    final seen = <String>{};
+
+    final total = wordCount;
+    // 1. Title match
+    for (var i = 0; i < total && results.length < limit; i++) {
+      final headword = wordAt(i);
+      if (headword.toLowerCase().contains(lowerQuery)) {
+        if (seen.add(headword)) {
+          final entries = await lookup(headword);
+          if (entries.isNotEmpty) {
+            final text = await entries.first.readText();
+            results.add(DictSearchResult(
+              article: entries.first,
+              snippet: extractSnippet(text, query),
+              score: headword.toLowerCase() == lowerQuery ? 3.0 : 2.0,
+            ));
+          }
+        }
+      }
+    }
+
+    // 2. Content scan for remaining slots
+    if (results.length < limit) {
+      for (var i = 0; i < total && results.length < limit; i++) {
+        final headword = wordAt(i);
+        if (seen.contains(headword)) continue;
+        final entries = await lookup(headword);
+        if (entries.isEmpty) continue;
+        final text = await entries.first.readText();
+        if (text.toLowerCase().contains(lowerQuery)) {
+          seen.add(headword);
+          results.add(DictSearchResult(
+            article: entries.first,
+            snippet: extractSnippet(text, query),
+            score: 1.0,
+          ));
+        }
+      }
+    }
+
+    results.sort((a, b) => b.score.compareTo(a.score));
+    return results;
+  }
 
   /// Optional companion MDD reader for resources (images, sounds, styles).
   DictReader? companionMdd;
@@ -138,6 +133,21 @@ class DictReader implements DictionaryReader {
       return companionMdd!.getResource(path);
     }
     return null;
+  }
+
+  @override
+  Future<Stream<List<int>>?> getResourceStream(
+    String path, {
+    int? start,
+    int? end,
+  }) async {
+    final bytes = await getResource(path);
+    if (bytes == null) return null;
+    final length = bytes.length;
+    final s = (start ?? 0).clamp(0, length);
+    final e = (end ?? length).clamp(s, length);
+    if (s >= e) return Stream.value(Uint8List(0));
+    return Stream.value(Uint8List.sublistView(bytes, s, e));
   }
 
   Future<RecordOffsetInfo?> _locateResource(String path) async {
@@ -307,6 +317,7 @@ class DictReader implements DictionaryReader {
   /// file; [importCidx] reads them back. The byte-level sort runs in an
   /// isolate, off the caller's isolate. Requires a completed scan
   /// ([initDict] with keys), since the index is built from it.
+  @override
   Future<Uint8List> exportCidx() async {
     if (!_keyListReady) {
       throw StateError('Dictionary keys have not been scanned yet');
@@ -343,6 +354,7 @@ class DictReader implements DictionaryReader {
   /// index bytes directly, without materializing the headword strings.
   /// The file-order streaming API still works: it builds the file-order
   /// key list from the index lazily, on first use.
+  @override
   Future<void> importCidx(Uint8List bytes) async {
     final data = parseCidx(bytes);
     final cidxHeader = data.header;
@@ -1154,12 +1166,12 @@ class DictReader implements DictionaryReader {
 
     if (_version >= 2.0) {
       if ((_encrypt & 0x02) != 0) {
-        final key = RIPEMD128
-            .hash(keyBlockInfoCompressed.sublist(4, 8) + [149, 54, 0, 0]);
+        final key =
+            computeKeyBlockInfoKey(keyBlockInfoCompressed.sublist(4, 8));
         final encrypted = keyBlockInfoCompressed is Uint8List
             ? Uint8List.sublistView(keyBlockInfoCompressed, 8)
             : Uint8List.fromList(keyBlockInfoCompressed.sublist(8));
-        _fastDecrypt(encrypted, Uint8List.fromList(key));
+        fastDecrypt(encrypted, key);
         keyBlockInfo = zlib.decode(encrypted);
       } else {
         keyBlockInfo = zlib.decode(_sliceBytes(
@@ -1591,70 +1603,6 @@ class DictReader implements DictionaryReader {
 
     return dataReturned;
   }
-}
-
-/// Represents a record from an MDD file.
-///
-/// An MDD record typically contains a key (the word or phrase) and its
-/// associated raw binary data.
-class MddRecord {
-  /// The key text associated with the record.
-  final String keyText;
-
-  /// The raw binary data of the record.
-  final List<int> data;
-
-  /// Creates a new [MddRecord] instance.
-  const MddRecord(this.keyText, this.data);
-}
-
-/// Represents a record from an MDX file.
-///
-/// An MDX record typically contains a key (the word or phrase) and its
-/// associated textual data (e.g., definition, explanation).
-class MdxRecord {
-  /// The key text associated with the record.
-  final String keyText;
-
-  /// The textual data of the record.
-  final String data;
-
-  /// Creates a new [MdxRecord] instance.
-  const MdxRecord(this.keyText, this.data);
-}
-
-/// Represents offset information for a record within a dictionary file.
-///
-/// This class provides details necessary to locate and decompress a specific
-/// record's data from the dictionary file, without needing to load the entire
-/// record block into memory.
-class RecordOffsetInfo {
-  /// The key text associated with the record.
-  final String keyText;
-
-  /// The byte offset of the record block within the dictionary file.
-  final int recordBlockOffset;
-
-  /// The starting offset of the record's data within its decompressed record block.
-  final int startOffset;
-
-  /// The ending offset of the record's data within its decompressed record block.
-  final int endOffset;
-
-  /// The compressed size of the record block containing this record.
-  final int compressedSize;
-
-  /// All record block segments containing this record.
-  ///
-  /// This is empty for instances created with the original constructor shape.
-  /// When a record spans multiple blocks, the segments are needed by
-  /// [readOneMdx] and [readOneMdd] to reconstruct the complete record.
-  final List<(int, int, int, int)> segments;
-
-  /// Creates a new [RecordOffsetInfo] instance.
-  const RecordOffsetInfo(this.keyText, this.recordBlockOffset, this.startOffset,
-      this.endOffset, this.compressedSize,
-      {this.segments = const []});
 }
 
 class _PendingRecord {
