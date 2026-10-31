@@ -143,3 +143,60 @@ void main() async {
   await dictReader.close();
 }
 ```
+
+## StarDict
+
+```dart
+import 'package:dict_reader/dict_reader.dart';
+
+void main() async {
+  final reader = StarDictReader("/path/to/dict"); // path without .ifo extension
+  await reader.init();
+
+  print('Book name: ${reader.bookName}');
+  print('Word count: ${reader.wordCount}');
+
+  final entries = await reader.lookup("hello");
+  for (final entry in entries) {
+    for (final field in entry.fields) {
+      if (field.isText) {
+        print('${field.type}: ${field.text}');
+      }
+    }
+  }
+
+  await reader.close();
+}
+```
+
+## ZIM
+
+```dart
+import 'package:dict_reader/dict_reader.dart';
+
+void main() async {
+  final reader = ZimReader("/path/to/wikipedia.zim");
+  await reader.init();
+
+  print('Title: ${reader.title}');
+  print('Description: ${reader.description}');
+  print('Article count: ${reader.wordCount}');
+
+  // Lookup article (follows redirects by default)
+  final entries = await reader.lookup("Apple");
+  for (final entry in entries) {
+    print('Title: ${entry.title}');
+    final html = await entry.readText();
+    print(html);
+  }
+
+  // Prefix suggestions
+  final suggestions = reader.search("app", limit: 5);
+  print('Suggestions: $suggestions');
+
+  // Retrieve media/image resource by path
+  final imageBytes = await reader.readDataByPath("I/logo.png");
+
+  await reader.close();
+}
+```

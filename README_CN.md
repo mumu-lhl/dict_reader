@@ -4,7 +4,7 @@
 
 [English](./README.md) | 中文
 
-读取 mdict 文件，支持 MDX/MDD 文件格式。
+读取词典文件，支持 MDX/MDD (mdict)、StarDict 和 ZIM 文件格式。
 
 ## 缺点
 

@@ -4,7 +4,7 @@
 
 English | [中文](./README_CN.md)
 
-Reading mdict files, support MDX/MDD file formats.
+Reading dictionary files: MDX/MDD (mdict), StarDict, and ZIM file formats.
 
 ## Disadvantages
 

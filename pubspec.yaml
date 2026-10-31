@@ -1,5 +1,5 @@
 name: dict_reader
-description: Reading mdict files, support MDX/MDD file formats. It can simplify your writing of mdict-based dictionary software.
+description: Reading dictionary files, supporting MDX/MDD, StarDict, and ZIM file formats. It can simplify your writing of dictionary software.
 version: 1.6.1
 repository: https://github.com/mumu-lhl/dict_reader
 
@@ -16,3 +16,5 @@ dependencies:
   collection: ^1.19.1
   html_unescape: ^2.0.0
   unorm_dart: ^0.3.3
+  archive: ^4.5.2
+  crypto: ^3.0.8

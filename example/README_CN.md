@@ -143,3 +143,60 @@ void main() async {
   await dictReader.close();
 }
 ```
+
+## StarDict
+
+```dart
+import 'package:dict_reader/dict_reader.dart';
+
+void main() async {
+  final reader = StarDictReader("/path/to/dict"); // 不含 .ifo 后缀的基础路径
+  await reader.init();
+
+  print('词典名称: ${reader.bookName}');
+  print('词条数: ${reader.wordCount}');
+
+  final entries = await reader.lookup("hello");
+  for (final entry in entries) {
+    for (final field in entry.fields) {
+      if (field.isText) {
+        print('${field.type}: ${field.text}');
+      }
+    }
+  }
+
+  await reader.close();
+}
+```
+
+## ZIM
+
+```dart
+import 'package:dict_reader/dict_reader.dart';
+
+void main() async {
+  final reader = ZimReader("/path/to/wikipedia.zim");
+  await reader.init();
+
+  print('标题: ${reader.title}');
+  print('描述: ${reader.description}');
+  print('词条数: ${reader.wordCount}');
+
+  // 查询词条（默认自动跟随重定向）
+  final entries = await reader.lookup("Apple");
+  for (final entry in entries) {
+    print('标题: ${entry.title}');
+    final html = await entry.readText();
+    print(html);
+  }
+
+  // 前缀建议搜索
+  final suggestions = reader.search("app", limit: 5);
+  print('搜索建议: $suggestions');
+
+  // 按路径读取资源/图片数据
+  final imageBytes = await reader.readDataByPath("I/logo.png");
+
+  await reader.close();
+}
+```
