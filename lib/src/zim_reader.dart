@@ -5,11 +5,12 @@ import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 
+import 'dictionary_reader.dart';
 import 'exceptions.dart';
 import 'normalize.dart';
 
 /// A single entry inside a ZIM archive (article, image, redirect, metadata, etc.).
-class ZimEntry {
+class ZimEntry implements DictArticle {
   /// Index in the path pointer list.
   final int index;
 
@@ -24,7 +25,17 @@ class ZimEntry {
   /// it defaults to [path].
   final String title;
 
+  @override
+  String get headword => title;
+
+  @override
+  String get format => 'zim';
+
+  @override
+  dynamic get raw => this;
+
   /// MIME type string (e.g. "text/html", "image/png").
+  @override
   final String mimeType;
 
   /// Whether this entry is a redirect pointing to another entry.
@@ -77,9 +88,11 @@ class ZimEntry {
       mimeType == 'application/javascript' || mimeType == 'text/javascript';
 
   /// Reads the raw data bytes of this entry from its cluster blob.
+  @override
   Future<Uint8List> readData() => reader.readBlob(clusterNumber, blobNumber);
 
   /// Reads the entry data decoded as text.
+  @override
   Future<String> readText([Encoding encoding = utf8]) async {
     final bytes = await readData();
     return encoding.decode(bytes);
@@ -103,11 +116,14 @@ class ZimEntry {
 ///   final html = await entries.first.readText();
 /// }
 /// ```
-class ZimReader {
+class ZimReader implements DictionaryReader {
   /// Path to the `.zim` file.
   final String path;
 
   ZimReader(this.path);
+
+  @override
+  Future<Uint8List?> getResource(String path) => readDataByPath(path);
 
   RandomAccessFile? _file;
   bool _initialized = false;
@@ -170,6 +186,7 @@ class ZimReader {
   Map<String, String> get metadata => Map.unmodifiable(_metadata);
 
   String get bookName => title.isNotEmpty ? title : (metadata['Name'] ?? '');
+  @override
   String get title => metadata['Title'] ?? '';
   String get description => metadata['Description'] ?? '';
   String get language => metadata['Language'] ?? '';
@@ -178,6 +195,7 @@ class ZimReader {
   String get date => metadata['Date'] ?? '';
 
   /// Total number of article headwords.
+  @override
   int get wordCount => _articleIndices.length;
 
   /// All article headwords in sorted order.
@@ -269,6 +287,7 @@ class ZimReader {
   }
 
   /// Whether [word] exists as an article in this archive.
+  @override
   bool exist(String word) => resolveIndex(word) != null;
 
   /// Resolves [word] to an entry index: exact title first, then normalized NFC,
@@ -308,6 +327,7 @@ class ZimReader {
   ///
   /// When [followRedirects] is `true` (default), redirects are automatically
   /// followed to return the target content entry.
+  @override
   Future<List<ZimEntry>> lookup(
     String word, {
     bool followRedirects = true,
@@ -356,11 +376,13 @@ class ZimReader {
 
   /// Prefix search over article headwords/titles, case-insensitive and NFC-normalised,
   /// returning at most [limit] suggestions.
-  List<String> search(String query, {int limit = 30}) {
+  @override
+  List<String> search(String query, {int? limit = 30}) {
     if (!_initialized) {
       throw StateError('ZimReader.init() has not completed');
     }
     if (query.isEmpty) return const [];
+    final maxResults = limit ?? 30;
 
     final lowerQuery = normalizeKey(query).toLowerCase();
 
@@ -380,7 +402,9 @@ class ZimReader {
 
     final results = <String>[];
     final seen = <String>{};
-    for (var i = lo; i < _searchOrder.length && results.length < limit; i++) {
+    for (var i = lo;
+        i < _searchOrder.length && results.length < maxResults;
+        i++) {
       final title = _articleTitles[_searchOrder[i]];
       final norm = normalizeKey(title).toLowerCase();
       if (!norm.startsWith(lowerQuery)) break;
@@ -563,6 +587,7 @@ class ZimReader {
   }
 
   /// Closes the underlying file and releases memory caches.
+  @override
   Future<void> close() async {
     await _file?.close();
     _file = null;

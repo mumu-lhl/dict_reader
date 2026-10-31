@@ -4,6 +4,7 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'cidx.dart';
+import 'dictionary_reader.dart';
 import 'normalize.dart';
 
 /// One typed field inside a StarDict entry.
@@ -27,11 +28,45 @@ class StarDictField {
 
 /// A single dictionary entry: the headword plus its typed fields, in the
 /// order they appear in the `.dict` data.
-class StarDictEntry {
+class StarDictEntry implements DictArticle {
+  @override
   final String headword;
   final List<StarDictField> fields;
 
   const StarDictEntry({required this.headword, required this.fields});
+
+  @override
+  String get format => 'stardict';
+
+  @override
+  dynamic get raw => this;
+
+  @override
+  String get mimeType =>
+      fields.any((f) => f.type == 'h') ? 'text/html' : 'text/plain';
+
+  /// Combined text content of all text fields in this entry.
+  String get content {
+    final sb = StringBuffer();
+    for (final f in fields) {
+      if (f.text != null) {
+        if (sb.isNotEmpty) sb.writeln();
+        sb.write(f.text);
+      }
+    }
+    return sb.toString();
+  }
+
+  @override
+  Future<String> readText() async => content;
+
+  @override
+  Future<Uint8List> readData() async {
+    for (final f in fields) {
+      if (f.data != null) return f.data!;
+    }
+    return Uint8List.fromList(utf8.encode(content));
+  }
 }
 
 /// Whether a StarDict type code holds a length-prefixed binary blob
@@ -193,7 +228,7 @@ class DictZipReader {
 /// await reader.init();
 /// final entries = await reader.lookup('hello');
 /// ```
-class StarDictReader {
+class StarDictReader implements DictionaryReader {
   /// Base path of the dictionary: the `.ifo` path minus the extension.
   final String path;
 
@@ -204,11 +239,19 @@ class StarDictReader {
   /// All key/value pairs parsed from the `.ifo` file.
   Map<String, String> get ifo => Map.unmodifiable(_ifo);
 
+  @override
+  String get title => bookName;
+
   String get bookName => _ifo['bookname'] ?? '';
   String get version => _ifo['version'] ?? '';
   String? get sameTypeSequence => _ifo['sametypesequence'];
+
+  @override
   int get wordCount =>
       int.tryParse(_ifo['wordcount'] ?? '') ?? _idxEntryOffsets.length;
+
+  @override
+  Future<Uint8List?> getResource(String path) async => null;
 
   // On-disk index state, built by init(). The `.idx` (and `.syn`) files
   // are themselves sorted indexes, so they are read whole into memory
@@ -418,6 +461,7 @@ class StarDictReader {
 
   /// Whether [word] (or its lowercase form, or a synonym of it) has an
   /// entry in this dictionary.
+  @override
   bool exist(String word) => resolveIndex(word) != null;
 
   /// Resolves [word] to an index position: exact match first, then the
@@ -509,6 +553,7 @@ class StarDictReader {
   /// Looks up [word] and returns its entries. Synonyms resolve to the
   /// entry of the word they point at. Returns an empty list when the word
   /// is not in the dictionary.
+  @override
   Future<List<StarDictEntry>> lookup(String word) async {
     if (!_initialized) {
       throw StateError('StarDictReader.init() has not completed');
@@ -544,8 +589,10 @@ class StarDictReader {
   /// Prefix search over the headwords and synonyms, case-insensitive,
   /// returning at most [limit] matches sorted alphabetically. Runs against
   /// the pre-sorted index built by [init] instead of scanning every word.
-  List<String> search(String query, {int limit = 30}) {
+  @override
+  List<String> search(String query, {int? limit = 30}) {
     if (query.isEmpty) return const [];
+    final maxResults = limit ?? 30;
     // Normalise both sides: the search order is sorted by the lowercased NFC
     // form, so a decomposed query still lands on the right headwords.
     final lowerQuery = normalizeKey(query).toLowerCase();
@@ -564,7 +611,9 @@ class StarDictReader {
       }
     }
     final results = <String>[];
-    for (var i = lo; i < _searchOrder.length && results.length < limit; i++) {
+    for (var i = lo;
+        i < _searchOrder.length && results.length < maxResults;
+        i++) {
       final word = _searchWordAt(_searchOrder[i]);
       if (!normalizeKey(word).toLowerCase().startsWith(lowerQuery)) break;
       results.add(word);
@@ -620,6 +669,7 @@ class StarDictReader {
     return fields;
   }
 
+  @override
   Future<void> close() async {
     await _dictFile?.close();
     _dictFile = null;

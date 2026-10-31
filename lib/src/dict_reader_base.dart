@@ -8,6 +8,7 @@ import "package:charset/charset.dart";
 import "package:html_unescape/html_unescape.dart";
 
 import "cidx.dart";
+import "dictionary_reader.dart";
 import "exceptions.dart";
 import "normalize.dart";
 
@@ -68,10 +69,92 @@ int _findUtf16Terminator(Uint8List bytes, int start) {
   return index;
 }
 
+/// A single MDX/MDD dictionary entry implementing [DictArticle].
+class MdxEntry implements DictArticle {
+  final RecordOffsetInfo offsetInfo;
+  final DictReader reader;
+
+  const MdxEntry({required this.offsetInfo, required this.reader});
+
+  @override
+  String get headword => offsetInfo.keyText;
+
+  @override
+  String get mimeType =>
+      reader.isMdx ? 'text/html' : 'application/octet-stream';
+
+  @override
+  String get format => reader.isMdx ? 'mdx' : 'mdd';
+
+  @override
+  dynamic get raw => offsetInfo;
+
+  @override
+  Future<String> readText() => reader.readOneMdx(offsetInfo);
+
+  @override
+  Future<Uint8List> readData() async =>
+      Uint8List.fromList(await reader.readRecordData(offsetInfo));
+
+  @override
+  String toString() => 'MdxEntry($headword, format: $format)';
+}
+
 /// Reading MDX/MDD files.
-class DictReader {
+class DictReader implements DictionaryReader {
   final String _path;
   final Map<String, (String, String)> _stylesheet = {};
+
+  bool get isMdx => _mdx;
+
+  @override
+  String get title =>
+      _headerLoaded ? (header['Title'] ?? header['BookName'] ?? '') : '';
+
+  @override
+  int get wordCount => numEntries;
+
+  /// Optional companion MDD reader for resources (images, sounds, styles).
+  DictReader? companionMdd;
+
+  @override
+  Future<List<MdxEntry>> lookup(String word) async {
+    final list = await locateAll(word);
+    if (list.isEmpty) return const [];
+    return [for (final info in list) MdxEntry(offsetInfo: info, reader: this)];
+  }
+
+  @override
+  Future<Uint8List?> getResource(String path) async {
+    if (!_mdx) {
+      final info = await _locateResource(path);
+      if (info != null) {
+        final data = await readOneMdd(info);
+        return Uint8List.fromList(data);
+      }
+      return null;
+    }
+    if (companionMdd != null) {
+      return companionMdd!.getResource(path);
+    }
+    return null;
+  }
+
+  Future<RecordOffsetInfo?> _locateResource(String path) async {
+    final normalized = path.replaceAll('/', '\\');
+    final candidates = [
+      path,
+      '\\$normalized',
+      normalized,
+      '/$path',
+      if (path.startsWith('/') || path.startsWith('\\')) path.substring(1),
+    ];
+    for (final c in candidates) {
+      final info = await locate(c);
+      if (info != null) return info;
+    }
+    return null;
+  }
 
   late int numEntries;
   late int _numberWidth;
@@ -197,7 +280,10 @@ class DictReader {
   }
 
   /// Closes the dictionary file.
+  @override
   Future<void> close() async {
+    await companionMdd?.close();
+    companionMdd = null;
     final file = _f;
     _f = null;
     await file?.close();
@@ -424,7 +510,8 @@ class DictReader {
     }
   }
 
-  Future<List<int>> _readRecordData(RecordOffsetInfo recordOffsetInfo) async {
+  /// Reads raw record data for [recordOffsetInfo].
+  Future<List<int>> readRecordData(RecordOffsetInfo recordOffsetInfo) async {
     if (_f == null) {
       throw StateError("Dictionary is not initialized");
     }
@@ -477,7 +564,7 @@ class DictReader {
   /// [recordOffsetInfo] is obtained from [readWithOffset].
   /// Returns `List<int>`.
   Future<List<int>> readOneMdd(RecordOffsetInfo recordOffsetInfo) {
-    return _readRecordData(recordOffsetInfo);
+    return readRecordData(recordOffsetInfo);
   }
 
   /// Only reads a mdx file's one record.
@@ -486,7 +573,7 @@ class DictReader {
   /// Returns `String` if file format is mdx.
   /// Returns `List<int>` if file format is mdd.
   Future<String> readOneMdx(RecordOffsetInfo recordOffsetInfo) async {
-    final data = await _readRecordData(recordOffsetInfo);
+    final data = await readRecordData(recordOffsetInfo);
     return _treatRecordMdxData(data);
   }
 
@@ -626,6 +713,7 @@ class DictReader {
   ///
   /// This method can be used to get the content of a key after initialization.
   /// Returns an empty list if the key is not found.
+  @override
   List<String> search(String key, {int? limit}) {
     if (_cidxLoaded) {
       final query = _encodeQuery(key);
@@ -659,6 +747,7 @@ class DictReader {
   /// Checks if a key (word) exists in the dictionary.
   ///
   /// Returns `true` if the key is found, otherwise `false`.
+  @override
   bool exist(String key) {
     if (_cidxLoaded) {
       final query = _encodeQuery(key);
