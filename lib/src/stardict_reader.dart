@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
@@ -325,6 +326,29 @@ class StarDictReader implements DictionaryReader {
   DictZipReader? _dictZip;
   bool _initialized = false;
 
+  /// Serializes every operation that touches the shared [_dictFile] handle.
+  /// Dart's [RandomAccessFile] throws `FileSystemException: An async operation
+  /// is currently pending` when a second `setPosition`/`read` starts while
+  /// another is in flight, and the handle's position is shared state — so
+  /// concurrent lookups must never interleave on it. The same lock also
+  /// serializes [DictZipReader]'s chunk-cache mutations, which share the
+  /// handle. The lock is a future chain: each holder awaits its predecessor
+  /// and completes its own link on release, so an action that throws still
+  /// unblocks the next waiter.
+  Future<void> _fileLock = Future.value();
+
+  Future<T> _withFileLock<T>(Future<T> Function() action) async {
+    final previous = _fileLock;
+    final gate = Completer<void>();
+    _fileLock = gate.future;
+    await previous;
+    try {
+      return await action();
+    } finally {
+      gate.complete();
+    }
+  }
+
   File get _ifoFile => File('$path.ifo');
 
   /// The plain `.dict` file, or the `.dict.dz` when only the compressed
@@ -359,8 +383,14 @@ class StarDictReader implements DictionaryReader {
   Future<void> init() async {
     if (_initialized) return;
     await initMetadata();
+    // Copy the path and offset width to locals: the isolate closure must
+    // not capture `this` (the reader holds unsendable state such as the
+    // file-access lock future, and Isolate.run rejects the whole object
+    // graph when it does).
+    final basePath = path;
+    final offsetBits = _idxOffsetBits;
     final parsed = await Isolate.run(
-      () => _parseStarDictIndex(path, _idxOffsetBits),
+      () => _parseStarDictIndex(basePath, offsetBits),
     );
     _idxBytes = parsed.idxBytes;
     _idxEntryOffsets = parsed.idxEntryOffsets;
@@ -698,7 +728,14 @@ class StarDictReader implements DictionaryReader {
     return results;
   }
 
-  Future<Uint8List> _readDict(int offset, int size) async {
+  /// Reads [size] bytes at [offset] from the `.dict`/`.dict.dz` data,
+  /// serialized through [_withFileLock]: [_dictFile] is a single shared
+  /// handle whose position must not be moved by concurrent lookups, and
+  /// [DictZipReader.read] is only ever reached from here.
+  Future<Uint8List> _readDict(int offset, int size) =>
+      _withFileLock(() => _readDictLocked(offset, size));
+
+  Future<Uint8List> _readDictLocked(int offset, int size) async {
     if (_dictZip != null) {
       return _dictZip!.read(offset, size);
     }

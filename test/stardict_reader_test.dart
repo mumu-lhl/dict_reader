@@ -129,6 +129,78 @@ void main() {
     await reader.close();
   });
 
+  group('concurrent lookups', () {
+    // Regression tests for the shared-handle race: 40 entries with 60+
+    // char definitions spanning several 16-byte dictzip chunks, looked up
+    // 10 rounds x 40 concurrent lookup() calls on one reader. Before the
+    // _readDict file lock, most concurrent lookups returned wrong text or
+    // threw `FileSystemException: An async operation is currently pending`.
+    List<String> concurrentWords() => [
+          for (var i = 0; i < 40; i++) 'word${i.toString().padLeft(2, '0')}',
+        ];
+
+    String definitionFor(int i) =>
+        'Definition number $i: ${'0123456789' * 7} end $i';
+
+    StarDictFixtureBuilder concurrentBuilder() {
+      final builder = StarDictFixtureBuilder();
+      for (var i = 0; i < 40; i++) {
+        builder.add(concurrentWords()[i], [('m', definitionFor(i))]);
+      }
+      return builder;
+    }
+
+    Future<void> checkConcurrentLookups(StarDictReader reader) async {
+      final words = concurrentWords();
+      // Sequential baseline: every entry correct in order.
+      for (var i = 0; i < words.length; i++) {
+        final entries = await reader.lookup(words[i]);
+        expect(entries, hasLength(1));
+        expect(entries.single.headword, words[i]);
+        expect(entries.single.fields.single.text, definitionFor(i));
+      }
+      // Concurrent load: 10 rounds x 40 concurrent lookups, 400/400 correct.
+      var correct = 0;
+      for (var round = 0; round < 10; round++) {
+        final results = await Future.wait(
+          [for (final word in words) reader.lookup(word)],
+        );
+        for (var i = 0; i < words.length; i++) {
+          expect(results[i], hasLength(1));
+          expect(results[i].single.headword, words[i]);
+          expect(results[i].single.fields.single.text, definitionFor(i));
+          correct++;
+        }
+      }
+      expect(correct, 400);
+    }
+
+    test('returns correct entries for concurrent lookups of a .dict.dz',
+        () async {
+      final base = await concurrentBuilder().write(
+        dir,
+        'concurrent-dz',
+        dictZip: true,
+        dictZipChunkLength: 16,
+      );
+      final reader = StarDictReader(base);
+      await reader.init();
+      expect(reader.isDictZip, isTrue);
+      await checkConcurrentLookups(reader);
+      await reader.close();
+    });
+
+    test('returns correct entries for concurrent lookups of a plain .dict',
+        () async {
+      final base = await concurrentBuilder().write(dir, 'concurrent-plain');
+      final reader = StarDictReader(base);
+      await reader.init();
+      expect(reader.isDictZip, isFalse);
+      await checkConcurrentLookups(reader);
+      await reader.close();
+    });
+  });
+
   test('supports 64-bit index offsets', () async {
     final base = await basicBuilder().write(dir, 'wide', offsetBits: 64);
     final reader = StarDictReader(base);
