@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
@@ -96,21 +97,47 @@ class DictZipReader {
   final int _headerSize;
   final int _chunkLength;
   final List<int> _chunkCompressedLengths;
+
+  /// Compressed-data offset of each chunk, relative to the start of the
+  /// compressed data (i.e. excluding [_headerSize]): prefix sums over
+  /// [_chunkCompressedLengths], computed once in [open], so
+  /// [_compressedOffsetOfChunk] is an O(1) table lookup instead of an
+  /// O(n) scan per chunk read.
+  final List<int> _chunkCompressedOffsets;
   final int totalSize;
-  final Map<int, Uint8List> _chunkCache = {};
+
+  /// Decompressed-chunk cache: a byte-capped LRU. [LinkedHashMap]
+  /// iteration order is oldest first; a hit removes and re-inserts its
+  /// chunk at the end, marking it most recently used. [_cacheBytes]
+  /// tracks the total decompressed size so eviction can enforce
+  /// [_maxChunkCacheBytes].
+  final LinkedHashMap<int, Uint8List> _chunkCache = LinkedHashMap();
+  int _cacheBytes = 0;
+  static const int _maxChunkCacheBytes = 4 * 1024 * 1024;
+
+  /// Chunk numbers currently in the decompression cache, oldest
+  /// (least-recently-used) first. Exposed so tests can assert on LRU
+  /// eviction behaviour.
+  List<int> get cachedChunkOrder => List.unmodifiable(_chunkCache.keys);
+
+  /// Total decompressed bytes currently held in the chunk cache.
+  int get cachedChunkBytes => _cacheBytes;
+
+  /// Maximum decompressed bytes the chunk cache may hold.
+  int get maxChunkCacheBytes => _maxChunkCacheBytes;
 
   DictZipReader._(
     this._file,
     this._headerSize,
     this._chunkLength,
     this._chunkCompressedLengths,
+    this._chunkCompressedOffsets,
     this.totalSize,
   );
 
   static Future<DictZipReader> open(RandomAccessFile file) async {
     await file.setPosition(0);
-    final header = await file.read(4096);
-    final bd = ByteData.sublistView(header);
+    var header = await file.read(4096);
     if (header.length < 18 || header[0] != 0x1f || header[1] != 0x8b) {
       throw const FormatException('Not a gzip file');
     }
@@ -120,24 +147,42 @@ class DictZipReader {
     final flags = header[3];
     var pos = 10; // magic(2) method(1) flags(1) mtime(4) xfl(1) os(1)
 
+    // The RA chunk table costs one uint16 per chunk, so a large
+    // `.dict.dz` pushes the gzip header past the initial 4096-byte read
+    // (>2037 chunks overflow it). Grow the buffered header on demand so
+    // every field parsed below stays in range.
+    Future<void> ensureBytes(int end) async {
+      if (header.length >= end) return;
+      final more = await file.read(end - header.length);
+      header = Uint8List.fromList([...header, ...more]);
+      if (header.length < end) {
+        throw const FormatException('Truncated gzip header');
+      }
+    }
+
     int? chunkLength;
     List<int>? chunkCompressedLengths;
     if (flags & 0x04 != 0) {
       // FEXTRA
-      final xlen = bd.getUint16(pos, Endian.little);
+      final xlen = header[pos] | (header[pos + 1] << 8);
       final extraStart = pos + 2;
       final extraEnd = extraStart + xlen;
+      await ensureBytes(extraEnd);
+      final bd = ByteData.sublistView(header);
       var p = extraStart;
       while (p + 4 <= extraEnd) {
         final si1 = header[p];
         final si2 = header[p + 1];
         final slen = bd.getUint16(p + 2, Endian.little);
-        if (si1 == 0x52 && si2 == 0x41) {
+        if (si1 == 0x52 && si2 == 0x41 && slen >= 6) {
           // 'RA' subfield: version(2) chlen(2) chcnt(2) then chcnt uint16
           // compressed chunk lengths.
           final dataStart = p + 4;
-          chunkLength = bd.getUint16(dataStart + 2, Endian.little);
           final chunkCount = bd.getUint16(dataStart + 4, Endian.little);
+          if (dataStart + 6 + chunkCount * 2 > p + 4 + slen) {
+            throw const FormatException('Truncated dictzip RA extra field');
+          }
+          chunkLength = bd.getUint16(dataStart + 2, Endian.little);
           chunkCompressedLengths = [
             for (var i = 0; i < chunkCount; i++)
               bd.getUint16(dataStart + 6 + i * 2, Endian.little),
@@ -148,25 +193,53 @@ class DictZipReader {
       pos = extraEnd;
     }
     if (flags & 0x08 != 0) {
-      // FNAME: NUL-terminated.
-      while (header[pos] != 0) {
-        pos++;
+      // FNAME: NUL-terminated. It may itself run past the buffered
+      // header, so keep reading until the terminator is found.
+      while (true) {
+        final end = header.indexOf(0, pos);
+        if (end >= 0) {
+          pos = end + 1;
+          break;
+        }
+        final more = await file.read(256);
+        if (more.isEmpty) {
+          throw const FormatException('Truncated gzip header');
+        }
+        header = Uint8List.fromList([...header, ...more]);
       }
-      pos++;
     }
     if (flags & 0x10 != 0) {
       // FCOMMENT: NUL-terminated.
-      while (header[pos] != 0) {
-        pos++;
+      while (true) {
+        final end = header.indexOf(0, pos);
+        if (end >= 0) {
+          pos = end + 1;
+          break;
+        }
+        final more = await file.read(256);
+        if (more.isEmpty) {
+          throw const FormatException('Truncated gzip header');
+        }
+        header = Uint8List.fromList([...header, ...more]);
       }
-      pos++;
     }
     if (flags & 0x02 != 0) {
       // FHCRC
+      await ensureBytes(pos + 2);
       pos += 2;
     }
     if (chunkLength == null || chunkCompressedLengths == null) {
       throw const FormatException('gzip file has no dictzip RA extra field');
+    }
+    if (chunkLength == 0) {
+      throw const FormatException('dictzip chunk length is zero');
+    }
+
+    // Prefix sums of the compressed chunk lengths: the compressed-data
+    // offset of chunk i, with one extra entry holding the total.
+    final chunkCompressedOffsets = <int>[0];
+    for (final length in chunkCompressedLengths) {
+      chunkCompressedOffsets.add(chunkCompressedOffsets.last + length);
     }
 
     // The gzip trailer's ISIZE (last 4 bytes) is the total uncompressed size.
@@ -180,28 +253,43 @@ class DictZipReader {
       pos,
       chunkLength,
       chunkCompressedLengths,
+      chunkCompressedOffsets,
       totalSize,
     );
   }
 
-  int _compressedOffsetOfChunk(int chunk) {
-    var offset = _headerSize;
-    for (var i = 0; i < chunk; i++) {
-      offset += _chunkCompressedLengths[i];
-    }
-    return offset;
-  }
+  int _compressedOffsetOfChunk(int chunk) =>
+      _headerSize + _chunkCompressedOffsets[chunk];
 
   Future<Uint8List> _readChunk(int chunk) async {
-    final cached = _chunkCache[chunk];
-    if (cached != null) return cached;
+    final cached = _chunkCache.remove(chunk);
+    if (cached != null) {
+      // Hit: re-insert at the end to mark it most recently used.
+      _chunkCache[chunk] = cached;
+      return cached;
+    }
     await _file.setPosition(_compressedOffsetOfChunk(chunk));
     final compressed = await _file.read(_chunkCompressedLengths[chunk]);
     final inflated = ZLibDecoder(raw: true).convert(compressed);
     final result = Uint8List.fromList(inflated);
-    if (_chunkCache.length > 32) _chunkCache.clear();
-    _chunkCache[chunk] = result;
+    _cacheChunk(chunk, result);
     return result;
+  }
+
+  /// Inserts a decompressed chunk into the cache, evicting
+  /// least-recently-used chunks until the total cached bytes fit within
+  /// [_maxChunkCacheBytes]. A single chunk larger than the whole budget
+  /// is returned uncached, so the cap is never exceeded.
+  void _cacheChunk(int chunk, Uint8List bytes) {
+    if (bytes.length > _maxChunkCacheBytes) return;
+    while (_cacheBytes + bytes.length > _maxChunkCacheBytes &&
+        _chunkCache.isNotEmpty) {
+      final oldest = _chunkCache.keys.first;
+      final evicted = _chunkCache.remove(oldest)!;
+      _cacheBytes -= evicted.length;
+    }
+    _chunkCache[chunk] = bytes;
+    _cacheBytes += bytes.length;
   }
 
   /// Reads [length] uncompressed bytes starting at [offset].
@@ -273,12 +361,191 @@ class StarDictReader implements DictionaryReader {
       null;
 
   @override
-  Future<Uint8List> exportCidx() =>
-      throw UnsupportedError('exportCidx is not supported for StarDict');
+  Future<Uint8List> exportCidx() async {
+    if (!_initialized) {
+      throw StateError('StarDictReader.init() has not completed');
+    }
+    final idxFile = _resolvedStarDictIndexFile('$path.idx');
+    if (idxFile == null) {
+      throw StateError(
+        'StarDict index (.idx/.idx.gz/.idx.dz) not found for $path',
+      );
+    }
+    final idxStat = await idxFile.stat();
+    final idxPath = await idxFile.resolveSymbolicLinks();
+    final synFile = _resolvedStarDictIndexFile('$path.syn');
+    String? synPath;
+    int? synFileSize;
+    int? synFileModified;
+    if (synFile != null) {
+      final synStat = await synFile.stat();
+      synPath = await synFile.resolveSymbolicLinks();
+      synFileSize = synStat.size;
+      synFileModified = synStat.modified.microsecondsSinceEpoch;
+    }
+    return _buildStarDictCidx(
+      idxPath: idxPath,
+      idxFileSize: idxStat.size,
+      idxFileModified: idxStat.modified.microsecondsSinceEpoch,
+      synPath: synPath,
+      synFileSize: synFileSize,
+      synFileModified: synFileModified,
+      idxOffsetWidth: _idxOffsetWidth,
+      idxEntryOffsets: _idxEntryOffsets,
+      idxFileToSorted: _idxFileToSorted,
+      synEntryOffsets: _synEntryOffsets,
+      searchOrder: _searchOrder,
+      normalizedEntries: _normalizedEntries,
+      normalizedSynonyms: _normalizedSynonyms,
+    );
+  }
 
   @override
-  Future<void> importCidx(Uint8List bytes) =>
-      throw UnsupportedError('importCidx is not supported for StarDict');
+  Future<void> importCidx(Uint8List bytes) async {
+    // Parse and structurally validate first: a bad cache must not disturb
+    // a reader that is already working.
+    final cidx = _parseStarDictCidx(bytes);
+    if (_initialized) await close();
+    await initMetadata();
+
+    // The `.idx`/`.syn` bytes themselves are not cached — they already
+    // live on disk — so re-read them and check the fingerprint: a cache
+    // built from different bytes must be rejected so the caller can fall
+    // back to a full parse.
+    final idxBytes = _readStarDictIndexFile('$path.idx');
+    if (idxBytes == null) {
+      throw StateError(
+        'StarDict index (.idx/.idx.gz/.idx.dz) not found for $path',
+      );
+    }
+    final idxFile = _resolvedStarDictIndexFile('$path.idx');
+    if (idxFile == null) {
+      throw StateError('StarDict index (.idx/.idx.gz/.idx.dz) not found '
+          'for $path');
+    }
+    final idxPath = await idxFile.resolveSymbolicLinks();
+    final idxStat = await idxFile.stat();
+    if (idxPath != cidx.idxPath ||
+        idxStat.size != cidx.idxFileSize ||
+        idxStat.modified.microsecondsSinceEpoch != cidx.idxFileModified) {
+      throw const FormatException(
+        'StarDict index file has changed since the .cidx was exported',
+      );
+    }
+    Uint8List? synBytes;
+    if (cidx.synPath != null) {
+      final synFile = _resolvedStarDictIndexFile('$path.syn');
+      if (synFile == null) {
+        throw const FormatException(
+          'StarDict synonym index is missing since the .cidx was exported',
+        );
+      }
+      final synPath = await synFile.resolveSymbolicLinks();
+      final synStat = await synFile.stat();
+      if (synPath != cidx.synPath ||
+          synStat.size != cidx.synFileSize ||
+          synStat.modified.microsecondsSinceEpoch != cidx.synFileModified) {
+        throw const FormatException(
+          'StarDict synonym index has changed since the .cidx was exported',
+        );
+      }
+      synBytes = _readStarDictIndexFile('$path.syn');
+    } else if (_resolvedStarDictIndexFile('$path.syn') != null) {
+      throw const FormatException(
+        'StarDict synonym index appeared since the .cidx was exported',
+      );
+    }
+    if (synBytes == null && cidx.synEntryOffsets.isNotEmpty) {
+      throw const FormatException(
+        'StarDict .cidx carries synonym entries but no synonym index',
+      );
+    }
+    // Cross-check the cached offsets against the re-read index bytes:
+    // walking the `.idx` yields the file-order entry starts, and the
+    // cached sorted-order offsets must be exactly that set, with
+    // `idxFileToSorted` mapping each file-order position to its sorted
+    // position. This rejects a cache whose offsets point at the wrong
+    // entries without trusting the fingerprint alone.
+    final fileOrderOffsets = <int>[];
+    var idxPos = 0;
+    while (idxPos < idxBytes.length) {
+      final end = idxBytes.indexOf(0, idxPos);
+      if (end < 0) break;
+      fileOrderOffsets.add(idxPos);
+      idxPos = end + 1 + cidx.idxOffsetWidth + 4;
+    }
+    if (fileOrderOffsets.length != cidx.idxEntryOffsets.length) {
+      throw const FormatException(
+        'StarDict .cidx entry count does not match the index file',
+      );
+    }
+    final sortedCached = [...cidx.idxEntryOffsets]..sort();
+    final sortedFileOrder = [...fileOrderOffsets]..sort();
+    for (var i = 0; i < sortedCached.length; i++) {
+      if (sortedCached[i] != sortedFileOrder[i]) {
+        throw const FormatException(
+          'StarDict .cidx entry offsets do not match the index file',
+        );
+      }
+    }
+    for (var f = 0; f < fileOrderOffsets.length; f++) {
+      if (cidx.idxEntryOffsets[cidx.idxFileToSorted[f]] !=
+          fileOrderOffsets[f]) {
+        throw const FormatException(
+          'StarDict .cidx file-order map does not match the index file',
+        );
+      }
+    }
+    if (synBytes != null) {
+      final synFileOrderOffsets = <int>[];
+      var synPos = 0;
+      while (synPos < synBytes.length) {
+        final end = synBytes.indexOf(0, synPos);
+        if (end < 0) break;
+        synFileOrderOffsets.add(synPos);
+        synPos = end + 1 + 4;
+      }
+      if (synFileOrderOffsets.length != cidx.synEntryOffsets.length) {
+        throw const FormatException(
+          'StarDict .cidx synonym count does not match the synonym index',
+        );
+      }
+      for (var i = 0; i < synFileOrderOffsets.length; i++) {
+        if (synFileOrderOffsets[i] != cidx.synEntryOffsets[i]) {
+          throw const FormatException(
+            'StarDict .cidx synonym offsets do not match the synonym index',
+          );
+        }
+      }
+    }
+
+    _idxBytes = idxBytes;
+    _idxEntryOffsets = cidx.idxEntryOffsets;
+    _idxFileToSorted = cidx.idxFileToSorted;
+    _idxOffsetWidth = cidx.idxOffsetWidth;
+    _synBytes = synBytes;
+    _synEntryOffsets = cidx.synEntryOffsets;
+    _searchOrder = cidx.searchOrder;
+    _normalizedEntries = cidx.normalizedEntries;
+    _normalizedSynonyms = cidx.normalizedSynonyms;
+    _wordsCache = null;
+    await _openDictSource();
+    _initialized = true;
+  }
+
+  /// Opens the `.dict` data source (plain or `.dict.dz`) for random
+  /// access, shared by [init] and [importCidx].
+  Future<void> _openDictSource() async {
+    final dictSource = _dictSource;
+    if (dictSource == null) {
+      throw StateError('StarDict dictionary data (.dict/.dict.dz) not found '
+          'for $path');
+    }
+    _dictFile = await dictSource.open();
+    if (dictSource.path.endsWith('.dz')) {
+      _dictZip = await DictZipReader.open(_dictFile!);
+    }
+  }
 
   // On-disk index state, built by init(). The `.idx` (and `.syn`) files
   // are themselves sorted indexes, so they are read whole into memory
@@ -401,15 +668,7 @@ class StarDictReader implements DictionaryReader {
     _searchOrder = parsed.searchOrder;
     _normalizedEntries = parsed.normalizedEntries;
     _normalizedSynonyms = parsed.normalizedSynonyms;
-    final dictSource = _dictSource;
-    if (dictSource == null) {
-      throw StateError('StarDict dictionary data (.dict/.dict.dz) not found '
-          'for $path');
-    }
-    _dictFile = await dictSource.open();
-    if (dictSource.path.endsWith('.dz')) {
-      _dictZip = await DictZipReader.open(_dictFile!);
-    }
+    await _openDictSource();
     _initialized = true;
   }
 
@@ -839,6 +1098,416 @@ class _ParsedStarDictIndex {
   });
 }
 
+/// Compact on-disk binary index (`.cidx`) for StarDict dictionaries.
+///
+/// Unlike the MDX `.cidx` ([buildCidx]), this stores no key bytes: the
+/// `.idx` and `.syn` files are themselves the sorted indexes and stay on
+/// disk, so only the derived state a full parse produces is cached — the
+/// entry offsets, the file-order -> sorted-order map, the prefix-search
+/// order, and the NFC maps for non-NFC spellings. [importCidx] re-reads
+/// the `.idx`/`.syn` bytes from disk and validates them against the
+/// fingerprint in the header before installing the cached state.
+///
+/// Layout (all integers big-endian):
+///
+/// ```text
+/// header:
+///   magic            4 bytes  "SDIX"
+///   version          u32      1
+///   unicodeVersion   u32      Unicode tables used to normalise, major*100+minor
+///   idxOffsetWidth   u32      4 or 8 (bytes of the .idx data offset)
+///   idxPathLength    u32
+///   idxPath          bytes    resolved .idx path (UTF-8)
+///   idxFileSize      u64
+///   idxFileModified  u64      microseconds since epoch
+///   synPresent       u32      0 = no .syn at export, 1 = present
+///   [synPathLength   u32
+///    synPath         bytes    resolved .syn path (UTF-8)
+///    synFileSize     u64
+///    synFileModified u64]     only when synPresent == 1
+///   idxEntryCount    u64
+///   synEntryCount    u64
+///   searchOrderCount u64
+///   normEntryCount   u64
+///   normSynCount     u64
+/// body:
+///   idxEntryOffsets  idxEntryCount * u64, distinct (sorted order, so
+///                      not increasing; import cross-checks them against
+///                      the re-read `.idx`)
+///   idxFileToSorted  idxEntryCount * u64, a permutation of 0..n-1
+///   synEntryOffsets  synEntryCount * u64, strictly increasing
+///   searchOrder      searchOrderCount * i64 (negative codes are synonyms)
+///   normalizedEntries  normEntryCount * { keyLength u32, key bytes, value u64 }
+///   normalizedSynonyms normSynCount  * { keyLength u32, key bytes, value u64 }
+/// ```
+const _sdixVersion = 1;
+
+/// A parsed StarDict `.cidx` file: the fingerprint header plus the
+/// derived index state, as produced by [_parseStarDictCidx].
+class _StarDictCidxData {
+  final String idxPath;
+  final int idxFileSize;
+  final int idxFileModified;
+  final String? synPath;
+  final int? synFileSize;
+  final int? synFileModified;
+  final int idxOffsetWidth;
+  final List<int> idxEntryOffsets;
+  final List<int> idxFileToSorted;
+  final List<int> synEntryOffsets;
+  final List<int> searchOrder;
+  final Map<String, int> normalizedEntries;
+  final Map<String, int> normalizedSynonyms;
+
+  const _StarDictCidxData({
+    required this.idxPath,
+    required this.idxFileSize,
+    required this.idxFileModified,
+    required this.synPath,
+    required this.synFileSize,
+    required this.synFileModified,
+    required this.idxOffsetWidth,
+    required this.idxEntryOffsets,
+    required this.idxFileToSorted,
+    required this.synEntryOffsets,
+    required this.searchOrder,
+    required this.normalizedEntries,
+    required this.normalizedSynonyms,
+  });
+}
+
+/// The on-disk file [_readStarDictIndexFile] actually reads for [path]:
+/// the plain file when it exists, else `.gz`, else `.dz`, else null.
+/// The fingerprint in a StarDict `.cidx` names this file, not the base
+/// path, so the form that was parsed is the form that is checked.
+File? _resolvedStarDictIndexFile(String path) {
+  final plain = File(path);
+  if (plain.existsSync()) return plain;
+  for (final suffix in const ['.gz', '.dz']) {
+    final compressed = File('$path$suffix');
+    if (compressed.existsSync()) return compressed;
+  }
+  return null;
+}
+
+Uint8List _buildStarDictCidx({
+  required String idxPath,
+  required int idxFileSize,
+  required int idxFileModified,
+  required String? synPath,
+  required int? synFileSize,
+  required int? synFileModified,
+  required int idxOffsetWidth,
+  required List<int> idxEntryOffsets,
+  required List<int> idxFileToSorted,
+  required List<int> synEntryOffsets,
+  required List<int> searchOrder,
+  required Map<String, int> normalizedEntries,
+  required Map<String, int> normalizedSynonyms,
+}) {
+  final idxPathBytes = utf8.encode(idxPath);
+  final synPathBytes = synPath == null ? null : utf8.encode(synPath);
+  // Deterministic output: the NFC maps are written sorted by key.
+  final normEntryKeys = normalizedEntries.keys.toList()..sort();
+  final normEntryKeyBytes = [
+    for (final key in normEntryKeys) utf8.encode(key),
+  ];
+  final normSynKeys = normalizedSynonyms.keys.toList()..sort();
+  final normSynKeyBytes = [
+    for (final key in normSynKeys) utf8.encode(key),
+  ];
+  var headerSize = 4 + 4 + 4 + 4 + 4 + idxPathBytes.length + 8 + 8 + 4;
+  if (synPathBytes != null) {
+    headerSize += 4 + synPathBytes.length + 8 + 8;
+  }
+  headerSize += 8 + 8 + 8 + 8 + 8;
+  var bodySize = (idxEntryOffsets.length + idxFileToSorted.length) * 8 +
+      synEntryOffsets.length * 8 +
+      searchOrder.length * 8;
+  for (final keyBytes in normEntryKeyBytes) {
+    bodySize += 4 + keyBytes.length + 8;
+  }
+  for (final keyBytes in normSynKeyBytes) {
+    bodySize += 4 + keyBytes.length + 8;
+  }
+
+  final out = Uint8List(headerSize + bodySize);
+  final data = ByteData.sublistView(out);
+  var pos = 0;
+  out.setRange(pos, pos + 4, [0x53, 0x44, 0x49, 0x58]); // "SDIX"
+  pos += 4;
+  data.setUint32(pos, _sdixVersion, Endian.big);
+  pos += 4;
+  data.setUint32(pos, normalizationUnicodeVersion, Endian.big);
+  pos += 4;
+  data.setUint32(pos, idxOffsetWidth, Endian.big);
+  pos += 4;
+  data.setUint32(pos, idxPathBytes.length, Endian.big);
+  pos += 4;
+  out.setRange(pos, pos + idxPathBytes.length, idxPathBytes);
+  pos += idxPathBytes.length;
+  data.setUint64(pos, idxFileSize, Endian.big);
+  pos += 8;
+  data.setUint64(pos, idxFileModified, Endian.big);
+  pos += 8;
+  data.setUint32(pos, synPathBytes == null ? 0 : 1, Endian.big);
+  pos += 4;
+  if (synPathBytes != null) {
+    data.setUint32(pos, synPathBytes.length, Endian.big);
+    pos += 4;
+    out.setRange(pos, pos + synPathBytes.length, synPathBytes);
+    pos += synPathBytes.length;
+    data.setUint64(pos, synFileSize!, Endian.big);
+    pos += 8;
+    data.setUint64(pos, synFileModified!, Endian.big);
+    pos += 8;
+  }
+  data.setUint64(pos, idxEntryOffsets.length, Endian.big);
+  pos += 8;
+  data.setUint64(pos, synEntryOffsets.length, Endian.big);
+  pos += 8;
+  data.setUint64(pos, searchOrder.length, Endian.big);
+  pos += 8;
+  data.setUint64(pos, normEntryKeys.length, Endian.big);
+  pos += 8;
+  data.setUint64(pos, normSynKeys.length, Endian.big);
+  pos += 8;
+  for (final offset in idxEntryOffsets) {
+    data.setUint64(pos, offset, Endian.big);
+    pos += 8;
+  }
+  for (final sorted in idxFileToSorted) {
+    data.setUint64(pos, sorted, Endian.big);
+    pos += 8;
+  }
+  for (final offset in synEntryOffsets) {
+    data.setUint64(pos, offset, Endian.big);
+    pos += 8;
+  }
+  for (final code in searchOrder) {
+    data.setInt64(pos, code, Endian.big);
+    pos += 8;
+  }
+  for (var i = 0; i < normEntryKeys.length; i++) {
+    final keyBytes = normEntryKeyBytes[i];
+    data.setUint32(pos, keyBytes.length, Endian.big);
+    pos += 4;
+    out.setRange(pos, pos + keyBytes.length, keyBytes);
+    pos += keyBytes.length;
+    data.setUint64(pos, normalizedEntries[normEntryKeys[i]]!, Endian.big);
+    pos += 8;
+  }
+  for (var i = 0; i < normSynKeys.length; i++) {
+    final keyBytes = normSynKeyBytes[i];
+    data.setUint32(pos, keyBytes.length, Endian.big);
+    pos += 4;
+    out.setRange(pos, pos + keyBytes.length, keyBytes);
+    pos += keyBytes.length;
+    data.setUint64(pos, normalizedSynonyms[normSynKeys[i]]!, Endian.big);
+    pos += 8;
+  }
+  return out;
+}
+
+/// Parses and fully validates a StarDict `.cidx` file: magic, version,
+/// Unicode tables, offset width, and a linear walk over every section
+/// (synonym offsets strictly increasing, entry offsets distinct, the
+/// file-order map a permutation, search codes in range and duplicate-free,
+/// NFC map values in range, the body exactly consumed). Throws
+/// [FormatException] on any inconsistency, including a cache built with
+/// different normalisation tables — callers fall back to a full parse in
+/// that case.
+_StarDictCidxData _parseStarDictCidx(Uint8List bytes) {
+  final data = ByteData.sublistView(bytes);
+  var pos = 0;
+
+  int need(int count) {
+    if (pos + count > bytes.length) {
+      throw const FormatException('Truncated StarDict .cidx file');
+    }
+    final value = pos;
+    pos += count;
+    return value;
+  }
+
+  int u32() => data.getUint32(need(4), Endian.big);
+  int u64() => data.getUint64(need(8), Endian.big);
+  int i64() => data.getInt64(need(8), Endian.big);
+
+  if (bytes.length < 4 ||
+      bytes[0] != 0x53 ||
+      bytes[1] != 0x44 ||
+      bytes[2] != 0x49 ||
+      bytes[3] != 0x58) {
+    throw const FormatException('Not a StarDict .cidx file');
+  }
+  pos = 4;
+  if (u32() != _sdixVersion) {
+    throw const FormatException('Unsupported StarDict .cidx version');
+  }
+  if (u32() != normalizationUnicodeVersion) {
+    throw const FormatException('Stale StarDict .cidx Unicode tables');
+  }
+  final idxOffsetWidth = u32();
+  if (idxOffsetWidth != 4 && idxOffsetWidth != 8) {
+    throw const FormatException('Invalid StarDict .cidx offset width');
+  }
+  final idxPathLength = u32();
+  final idxPathStart = need(idxPathLength);
+  final idxPath = utf8.decode(
+    Uint8List.sublistView(bytes, idxPathStart, idxPathStart + idxPathLength),
+  );
+  final idxFileSize = u64();
+  final idxFileModified = u64();
+  final synPresent = u32();
+  if (synPresent != 0 && synPresent != 1) {
+    throw const FormatException('Invalid StarDict .cidx synonym flag');
+  }
+  String? synPath;
+  int? synFileSize;
+  int? synFileModified;
+  if (synPresent == 1) {
+    final synPathLength = u32();
+    final synPathStart = need(synPathLength);
+    synPath = utf8.decode(
+      Uint8List.sublistView(
+        bytes,
+        synPathStart,
+        synPathStart + synPathLength,
+      ),
+    );
+    synFileSize = u64();
+    synFileModified = u64();
+  }
+  final idxEntryCount = u64();
+  final synEntryCount = u64();
+  final searchOrderCount = u64();
+  final normEntryCount = u64();
+  final normSynCount = u64();
+  if (synPresent == 0 && synEntryCount != 0) {
+    throw const FormatException(
+      'StarDict .cidx has synonym entries but no synonym index',
+    );
+  }
+
+  final idxEntryOffsets = <int>[];
+  for (var i = 0; i < idxEntryCount; i++) {
+    idxEntryOffsets.add(u64());
+  }
+  final idxFileToSorted = <int>[];
+  for (var i = 0; i < idxEntryCount; i++) {
+    idxFileToSorted.add(u64());
+  }
+  final synEntryOffsets = <int>[];
+  for (var i = 0; i < synEntryCount; i++) {
+    synEntryOffsets.add(u64());
+  }
+  final searchOrder = <int>[];
+  for (var i = 0; i < searchOrderCount; i++) {
+    searchOrder.add(i64());
+  }
+  Map<String, int> readNormMap(int count) {
+    final map = <String, int>{};
+    for (var i = 0; i < count; i++) {
+      final keyLength = u32();
+      final keyStart = need(keyLength);
+      final key = utf8.decode(
+        Uint8List.sublistView(bytes, keyStart, keyStart + keyLength),
+      );
+      final value = u64();
+      if (map.containsKey(key)) {
+        throw const FormatException(
+          'StarDict .cidx has a duplicate normalised key',
+        );
+      }
+      map[key] = value;
+    }
+    return map;
+  }
+
+  final normalizedEntries = readNormMap(normEntryCount);
+  final normalizedSynonyms = readNormMap(normSynCount);
+  if (pos != bytes.length) {
+    throw const FormatException('StarDict .cidx has trailing bytes');
+  }
+
+  // Structural validation of the derived state, so a corrupt cache is
+  // rejected here rather than producing wrong lookups later. The entry
+  // offsets are in sorted order, so only distinctness can be checked
+  // without the index bytes; importCidx cross-checks them against the
+  // re-read `.idx` (same for the file-order map).
+  if (idxEntryOffsets.toSet().length != idxEntryOffsets.length) {
+    throw const FormatException(
+      'StarDict .cidx entry offsets are not distinct',
+    );
+  }
+  for (var i = 1; i < synEntryOffsets.length; i++) {
+    if (synEntryOffsets[i] <= synEntryOffsets[i - 1]) {
+      throw const FormatException(
+        'StarDict .cidx synonym offsets are not increasing',
+      );
+    }
+  }
+  final seenSorted = Uint8List(idxEntryCount);
+  for (final sorted in idxFileToSorted) {
+    if (sorted < 0 || sorted >= idxEntryCount || seenSorted[sorted] == 1) {
+      throw const FormatException(
+        'StarDict .cidx file-order map is not a permutation',
+      );
+    }
+    seenSorted[sorted] = 1;
+  }
+  final seenCodes = <int>{};
+  for (final code in searchOrder) {
+    if (code >= 0) {
+      if (code >= idxEntryCount) {
+        throw const FormatException(
+          'StarDict .cidx search code is out of range',
+        );
+      }
+    } else if (-code - 1 < 0 || -code - 1 >= synEntryCount) {
+      throw const FormatException(
+        'StarDict .cidx search code is out of range',
+      );
+    }
+    if (!seenCodes.add(code)) {
+      throw const FormatException(
+        'StarDict .cidx search order has a duplicate code',
+      );
+    }
+  }
+  for (final value in normalizedEntries.values) {
+    if (value < 0 || value >= idxEntryCount) {
+      throw const FormatException(
+        'StarDict .cidx normalised entry is out of range',
+      );
+    }
+  }
+  for (final value in normalizedSynonyms.values) {
+    if (value < 0 || value >= idxEntryCount) {
+      throw const FormatException(
+        'StarDict .cidx normalised synonym is out of range',
+      );
+    }
+  }
+
+  return _StarDictCidxData(
+    idxPath: idxPath,
+    idxFileSize: idxFileSize,
+    idxFileModified: idxFileModified,
+    synPath: synPath,
+    synFileSize: synFileSize,
+    synFileModified: synFileModified,
+    idxOffsetWidth: idxOffsetWidth,
+    idxEntryOffsets: idxEntryOffsets,
+    idxFileToSorted: idxFileToSorted,
+    synEntryOffsets: synEntryOffsets,
+    searchOrder: searchOrder,
+    normalizedEntries: normalizedEntries,
+    normalizedSynonyms: normalizedSynonyms,
+  );
+}
+
 /// Reads a StarDict index file, transparently decompressing the `.gz` and
 /// `.dz` forms the format allows when the plain file is absent. Returns null
 /// when no form exists.
@@ -861,6 +1530,19 @@ Uint8List? _readStarDictIndexFile(String path) {
     }
   }
   return null;
+}
+
+/// Whether [word] is pure lowercase ASCII: no code unit above 0x7F and
+/// no uppercase letter (A-Z). [normalizeKey] is the identity on ASCII
+/// (see normalize.dart) and [String.toLowerCase] is the identity without
+/// an uppercase letter, so such a word is already its own lowercase NFC
+/// search key and can never contribute a normalised entry.
+bool _isLowerAscii(String word) {
+  for (var i = 0; i < word.length; i++) {
+    final unit = word.codeUnitAt(i);
+    if (unit > 0x7F || (unit >= 0x41 && unit <= 0x5A)) return false;
+  }
+  return true;
 }
 
 /// Parses the `.idx` (and `.syn`, when present) files of the dictionary at
@@ -902,8 +1584,29 @@ _ParsedStarDictIndex _parseStarDictIndex(String basePath, int idxOffsetBits) {
   // also keeps lookups working on files that are not, at the cost of
   // one int per entry.
   int wordEnd(int start) => idxBytes.indexOf(0, start);
-  final sortedOrder = List<int>.generate(fileOrderOffsets.length, (i) => i)
-    ..sort((a, b) {
+  final sortedOrder = List<int>.generate(fileOrderOffsets.length, (i) => i);
+  // Most `.idx` files are already in byte order: one linear scan proves
+  // it, and the identity permutation is exactly what the stable sort
+  // below would produce for such a file, so skip the O(n log n) sort.
+  var alreadySorted = true;
+  for (var i = 1; i < fileOrderOffsets.length; i++) {
+    final prevStart = fileOrderOffsets[i - 1];
+    final start = fileOrderOffsets[i];
+    if (compareBytes(
+          idxBytes,
+          prevStart,
+          wordEnd(prevStart) - prevStart,
+          idxBytes,
+          start,
+          wordEnd(start) - start,
+        ) >
+        0) {
+      alreadySorted = false;
+      break;
+    }
+  }
+  if (!alreadySorted) {
+    sortedOrder.sort((a, b) {
       final startA = fileOrderOffsets[a];
       final startB = fileOrderOffsets[b];
       return compareBytes(
@@ -915,6 +1618,7 @@ _ParsedStarDictIndex _parseStarDictIndex(String basePath, int idxOffsetBits) {
         wordEnd(startB) - startB,
       );
     });
+  }
   final idxEntryOffsets = [
     for (final fileIndex in sortedOrder) fileOrderOffsets[fileIndex],
   ];
@@ -953,10 +1657,23 @@ _ParsedStarDictIndex _parseStarDictIndex(String basePath, int idxOffsetBits) {
   final normalizedEntries = <String, int>{};
   for (var i = 0; i < fileOrderOffsets.length; i++) {
     final word = idxWordAtFileOrder(i);
-    if (seenWords.add(word)) {
-      pairs.add((normalizeKey(word).toLowerCase(), idxFileToSorted[i]));
+    // A lowercase-ASCII word is already its own lowercase NFC key
+    // ([normalizeKey] is the identity on ASCII, and toLowerCase is the
+    // identity without an uppercase letter), so it needs neither call.
+    // Anything else is normalised once and the result reused for both
+    // the search key and the normalised-entry map.
+    final String key;
+    final String lookup;
+    if (_isLowerAscii(word)) {
+      key = word;
+      lookup = word;
+    } else {
+      lookup = normalizeKey(word);
+      key = lookup.toLowerCase();
     }
-    final lookup = normalizeKey(word);
+    if (seenWords.add(word)) {
+      pairs.add((key, idxFileToSorted[i]));
+    }
     if (lookup != word) {
       normalizedEntries.putIfAbsent(lookup, () => idxFileToSorted[i]);
     }
@@ -968,8 +1685,16 @@ _ParsedStarDictIndex _parseStarDictIndex(String basePath, int idxOffsetBits) {
       final word = synWordAt(i);
       if (!seenSynonyms.add(word)) continue;
       if (seenWords.contains(word)) continue;
-      pairs.add((normalizeKey(word).toLowerCase(), -(i + 1)));
-      final lookup = normalizeKey(word);
+      final String key;
+      final String lookup;
+      if (_isLowerAscii(word)) {
+        key = word;
+        lookup = word;
+      } else {
+        lookup = normalizeKey(word);
+        key = lookup.toLowerCase();
+      }
+      pairs.add((key, -(i + 1)));
       if (lookup != word) {
         final start = synEntryOffsets[i];
         final end = synBytes.indexOf(0, start);

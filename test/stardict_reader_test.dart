@@ -129,6 +129,121 @@ void main() {
     await reader.close();
   });
 
+  group('DictZipReader large header and LRU cache', () {
+    // P0-1 regression: a .dict.dz with >2037 chunks has an RA extra field
+    // that pushes the gzip header past 4096 bytes; open() used to throw
+    // RangeError while parsing the chunk table.
+    test('opens a .dict.dz whose RA header exceeds 4096 bytes', () async {
+      const chunkLength = 512;
+      const chunkCount = 2266;
+      final data = Uint8List(chunkLength * chunkCount);
+      for (var i = 0; i < data.length; i++) {
+        data[i] = i % 251;
+      }
+      final file = File('${dir.path}/big.dict.dz');
+      await file.writeAsBytes(buildDictZip(data, chunkLength: chunkLength));
+      final raf = await file.open();
+      final reader = await DictZipReader.open(raf);
+      expect(reader.totalSize, data.length);
+      final back = await reader.read(0, data.length);
+      expect(back, data);
+      // A slice spanning the last chunks reads correctly too.
+      final tail = await reader.read(data.length - 1000, 1000);
+      expect(tail, Uint8List.sublistView(data, data.length - 1000));
+      await raf.close();
+    });
+
+    test('throws FormatException when the dictzip chunk length is zero',
+        () async {
+      final dz = Uint8List.fromList(
+        buildDictZip(Uint8List.fromList([1, 2, 3, 4]), chunkLength: 4),
+      );
+      // RA layout: 10-11 xlen, 12 'R', 13 'A', 14-15 slen, 16-17
+      // version, 18-19 chlen, 20-21 chcnt. Zero the chlen field.
+      dz[18] = 0;
+      dz[19] = 0;
+      final file = File('${dir.path}/zero-chlen.dict.dz');
+      await file.writeAsBytes(dz);
+      final raf = await file.open();
+      await expectLater(DictZipReader.open(raf), throwsFormatException);
+      await raf.close();
+    });
+
+    Future<DictZipReader> openDz(Uint8List data, int chunkLength) async {
+      final file = File('${dir.path}/dz-$chunkLength-${data.length}.dict.dz');
+      await file.writeAsBytes(buildDictZip(data, chunkLength: chunkLength));
+      final raf = await file.open();
+      addTearDown(raf.close);
+      return DictZipReader.open(raf);
+    }
+
+    test('re-reading a chunk hits the cache and marks it most recent',
+        () async {
+      final data = Uint8List(8 * 16);
+      for (var i = 0; i < data.length; i++) {
+        data[i] = i;
+      }
+      final reader = await openDz(data, 16);
+
+      expect(await reader.read(0, 16), Uint8List.sublistView(data, 0, 16));
+      expect(reader.cachedChunkOrder, [0]);
+      expect(reader.cachedChunkBytes, 16);
+      await reader.read(16, 16);
+      await reader.read(32, 16);
+      expect(reader.cachedChunkOrder, [0, 1, 2]);
+      // Re-reading chunk 0 hits the cache and moves it to the end.
+      expect(await reader.read(0, 16), Uint8List.sublistView(data, 0, 16));
+      expect(reader.cachedChunkOrder, [1, 2, 0]);
+      // ... and again for chunk 1.
+      await reader.read(16, 16);
+      expect(reader.cachedChunkOrder, [2, 0, 1]);
+      expect(reader.cachedChunkBytes, 3 * 16);
+    });
+
+    test('evicts the least-recently-used chunk once the byte cap is hit',
+        () async {
+      // 129 chunks of 32 KiB = ~4.2 MiB of decompressed data, over the
+      // 4 MiB cap, so exactly the 128 newest chunks stay cached. (The
+      // dictzip chunk length is a uint16, so chunks are capped at
+      // 65535 bytes.)
+      const chunkLength = 32 * 1024;
+      const chunkCount = 129;
+      final data = Uint8List(chunkLength * chunkCount);
+      for (var i = 0; i < data.length; i++) {
+        data[i] = i % 251;
+      }
+      final reader = await openDz(data, chunkLength);
+
+      for (var i = 0; i < chunkCount; i++) {
+        final back = await reader.read(i * chunkLength, chunkLength);
+        expect(
+          back,
+          Uint8List.sublistView(
+            data,
+            i * chunkLength,
+            (i + 1) * chunkLength,
+          ),
+        );
+      }
+      expect(reader.cachedChunkBytes, reader.maxChunkCacheBytes);
+      expect(reader.cachedChunkBytes, 128 * chunkLength);
+      expect(reader.cachedChunkOrder, [
+        for (var i = chunkCount - 128; i < chunkCount; i++) i,
+      ]);
+      // The oldest surviving chunk is still a hit, and the hit moves it
+      // to the most-recent end.
+      final oldest = chunkCount - 128;
+      await reader.read(oldest * chunkLength, chunkLength);
+      expect(reader.cachedChunkOrder.first, oldest + 1);
+      expect(reader.cachedChunkOrder.last, oldest);
+      // An evicted chunk still reads correctly after a fresh inflate.
+      final evicted = await reader.read(0, chunkLength);
+      expect(evicted, Uint8List.sublistView(data, 0, chunkLength));
+      expect(reader.cachedChunkOrder.last, 0);
+      expect(reader.cachedChunkOrder.length, 128);
+    });
+  });
+
   group('concurrent lookups', () {
     // Regression tests for the shared-handle race: 40 entries with 60+
     // char definitions spanning several 16-byte dictzip chunks, looked up
@@ -471,6 +586,258 @@ void main() {
       await reader.init();
       expect(reader.exist('fruit-fly'), isTrue);
       await reader.close();
+    });
+  });
+
+  group('StarDict .cidx export/import', () {
+    StarDictFixtureBuilder cidxBuilder() {
+      return StarDictFixtureBuilder()
+        ..add('apple', [('m', 'a fruit with red skin')])
+        ..add('banana', [('m', 'a long yellow fruit')])
+        ..add('Cherry', [('h', '<b>cherry</b> html content')])
+        // Synonyms in byte order: the `.syn` file is binary-searched
+        // in place, so it must be sorted like a real dictionary's.
+        ..addSynonym('FRUIT', 1)
+        ..addSynonym('fruit-fly', 1);
+    }
+
+    /// The user-visible behaviour a reader must show, whether it was
+    /// fully parsed or restored from a `.cidx`.
+    Future<void> checkCidxDictionary(StarDictReader reader) async {
+      expect(reader.words, ['Cherry', 'apple', 'banana']);
+      expect(reader.bookName, 'Test Dictionary');
+      expect(reader.search('ap'), ['apple']);
+      expect(reader.search('fr'), ['FRUIT', 'fruit-fly']);
+      expect(reader.search('FRU'), ['FRUIT', 'fruit-fly']);
+      expect(reader.resolveIndex('APPLE'), reader.resolveIndex('apple'));
+      expect(reader.exist('fruit-fly'), isTrue);
+      expect(reader.exist('FRUIT'), isTrue);
+      final apple = await reader.lookup('apple');
+      expect(apple.single.fields.first.text, 'a fruit with red skin');
+      final fly = await reader.lookup('fruit-fly');
+      expect(fly.single.headword, 'banana');
+      final fruit = await reader.lookup('FRUIT');
+      expect(fruit.single.headword, 'banana');
+      final cherry = await reader.lookup('Cherry');
+      expect(cherry.single.fields.single.type, 'h');
+    }
+
+    test('round-trips a dictionary with synonyms through export/import',
+        () async {
+      final base = await cidxBuilder().write(dir, 'cidx');
+      final reader = StarDictReader(base);
+      await reader.init();
+      await checkCidxDictionary(reader);
+      final bytes = await reader.exportCidx();
+      await reader.close();
+
+      final restored = StarDictReader(base);
+      await restored.importCidx(bytes);
+      await checkCidxDictionary(restored);
+      await restored.close();
+    });
+
+    test('round-trips a dictzip dictionary through export/import', () async {
+      final base = await cidxBuilder().write(
+        dir,
+        'cidx-dz',
+        dictZip: true,
+      );
+      final reader = StarDictReader(base);
+      await reader.init();
+      expect(reader.isDictZip, isTrue);
+      final bytes = await reader.exportCidx();
+      await reader.close();
+
+      final restored = StarDictReader(base);
+      await restored.importCidx(bytes);
+      expect(restored.isDictZip, isTrue);
+      await checkCidxDictionary(restored);
+      await restored.close();
+    });
+
+    test('round-trips a dictionary with 64-bit index offsets', () async {
+      final base = await cidxBuilder().write(
+        dir,
+        'cidx-wide',
+        offsetBits: 64,
+      );
+      final reader = StarDictReader(base);
+      await reader.init();
+      final bytes = await reader.exportCidx();
+      await reader.close();
+
+      final restored = StarDictReader(base);
+      await restored.importCidx(bytes);
+      await checkCidxDictionary(restored);
+      await restored.close();
+    });
+
+    test('round-trips a dictionary with decomposed headwords and synonyms',
+        () async {
+      final builder = StarDictFixtureBuilder()
+        ..add('banana', [('m', 'a long yellow fruit')])
+        ..add('ingle\u0301s', [('m', 'spanish')])
+        ..addSynonym('pla\u0301tano', 0);
+      final base = await builder.write(dir, 'cidx-nfc');
+      final reader = StarDictReader(base);
+      await reader.init();
+      final bytes = await reader.exportCidx();
+      await reader.close();
+
+      final restored = StarDictReader(base);
+      await restored.importCidx(bytes);
+      expect(restored.exist('ingl\u00E9s'), isTrue);
+      expect(
+        (await restored.lookup('ingl\u00E9s')).single.headword,
+        'ingle\u0301s',
+      );
+      expect(restored.search('ingl'), ['ingle\u0301s']);
+      expect(restored.exist('pl\u00E1tano'), isTrue);
+      expect(
+        (await restored.lookup('pl\u00E1tano')).single.headword,
+        'banana',
+      );
+      await restored.close();
+    });
+
+    test('exportCidx requires a completed init', () async {
+      final base = await cidxBuilder().write(dir, 'cidx-noinit');
+      final reader = StarDictReader(base);
+      await expectLater(reader.exportCidx(), throwsStateError);
+      await reader.close();
+    });
+
+    test('rejects a .cidx exported from a different dictionary', () async {
+      final baseA = await cidxBuilder().write(dir, 'cidx-a');
+      final readerA = StarDictReader(baseA);
+      await readerA.init();
+      final bytes = await readerA.exportCidx();
+      await readerA.close();
+
+      final baseB = await basicBuilder().write(dir, 'cidx-b');
+      final readerB = StarDictReader(baseB);
+      await expectLater(readerB.importCidx(bytes), throwsFormatException);
+      await readerB.close();
+    });
+
+    test('rejects a .cidx when the index file mtime changed', () async {
+      final base = await cidxBuilder().write(dir, 'cidx-mtime');
+      final reader = StarDictReader(base);
+      await reader.init();
+      final bytes = await reader.exportCidx();
+      await reader.close();
+
+      final idxFile = File('$base.idx');
+      final stat = await idxFile.stat();
+      await idxFile.setLastModified(
+        stat.modified.add(const Duration(seconds: 1)),
+      );
+
+      final restored = StarDictReader(base);
+      await expectLater(restored.importCidx(bytes), throwsFormatException);
+      await restored.close();
+    });
+
+    test('rejects a .cidx when the synonym index is gone', () async {
+      final base = await cidxBuilder().write(dir, 'cidx-syn-gone');
+      final reader = StarDictReader(base);
+      await reader.init();
+      final bytes = await reader.exportCidx();
+      await reader.close();
+
+      await File('$base.syn').delete();
+
+      final restored = StarDictReader(base);
+      await expectLater(restored.importCidx(bytes), throwsFormatException);
+      await restored.close();
+    });
+
+    test('rejects truncated or corrupt .cidx bytes', () async {
+      final base = await cidxBuilder().write(dir, 'cidx-corrupt');
+      final reader = StarDictReader(base);
+      await reader.init();
+      final bytes = await reader.exportCidx();
+      await reader.close();
+
+      final restored = StarDictReader(base);
+      await expectLater(
+        restored.importCidx(bytes.sublist(0, bytes.length ~/ 2)),
+        throwsFormatException,
+      );
+      await expectLater(
+        restored.importCidx(
+          Uint8List.fromList(bytes)..[0] = 'X'.codeUnitAt(0),
+        ),
+        throwsFormatException,
+      );
+      await expectLater(
+        restored.importCidx(Uint8List.fromList(bytes)..[4] = 99),
+        throwsFormatException,
+      );
+      await expectLater(
+        restored.importCidx(Uint8List.fromList([...bytes, 0])),
+        throwsFormatException,
+      );
+      await expectLater(
+        restored.importCidx(Uint8List.fromList([1, 2, 3])),
+        throwsFormatException,
+      );
+      await restored.close();
+    });
+  });
+
+  group('parse shape: sortedness and word kinds', () {
+    test('sorts an unsorted .idx, keeping duplicates in file order', () async {
+      final builder = StarDictFixtureBuilder()
+        ..add('banana', [('m', 'yellow')])
+        ..add('apple', [('m', 'red')])
+        ..add('Cherry', [('m', 'dark red')])
+        ..add('apple', [('m', 'green')]);
+      final base = await builder.write(dir, 'unsorted');
+      final reader = StarDictReader(base);
+      await reader.init();
+
+      expect(reader.words, ['Cherry', 'apple', 'apple', 'banana']);
+      expect(reader.search('a'), ['apple']);
+      final apples = await reader.lookup('apple');
+      expect(apples, hasLength(2));
+      expect(apples[0].fields.single.text, 'red');
+      expect(apples[1].fields.single.text, 'green');
+      await reader.close();
+    });
+
+    test('handles CJK headwords alongside ASCII ones', () async {
+      final builder = StarDictFixtureBuilder()
+        ..add('你好', [('m', 'hello')])
+        ..add('世界', [('m', 'world')])
+        ..add('你', [('m', 'you')])
+        ..add('apple', [('m', 'fruit')])
+        ..add('Apple', [('m', 'fruit capital')]);
+      final base = await builder.write(dir, 'cjk');
+      final reader = StarDictReader(base);
+      await reader.init();
+
+      // Byte order: ASCII first, then CJK by UTF-8 bytes.
+      expect(reader.words, ['Apple', 'apple', '世界', '你', '你好']);
+      expect(reader.search('你'), ['你', '你好']);
+      expect(reader.search('app'), ['apple', 'Apple']);
+      expect(
+        (await reader.lookup('世界')).single.fields.single.text,
+        'world',
+      );
+      final bytes = await reader.exportCidx();
+      await reader.close();
+
+      final restored = StarDictReader(base);
+      await restored.importCidx(bytes);
+      expect(restored.words, ['Apple', 'apple', '世界', '你', '你好']);
+      expect(restored.search('你'), ['你', '你好']);
+      expect(
+        (await restored.lookup('你好')).single.fields.single.text,
+        'hello',
+      );
+      await restored.close();
     });
   });
 }

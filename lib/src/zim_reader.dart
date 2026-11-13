@@ -158,6 +158,15 @@ class ZimSearchResult extends DictSearchResult {
   ZimEntry get zimEntry => article as ZimEntry;
 }
 
+/// One entry of [ZimReader]'s cluster cache: the decompressed cluster
+/// bytes plus the info byte read from the cluster header.
+class _CachedCluster {
+  final Uint8List bytes;
+  final int infoByte;
+
+  const _CachedCluster(this.bytes, this.infoByte);
+}
+
 /// Reader for ZIM archives (openZIM / Kiwix format).
 ///
 /// Supports reading articles, images, media, metadata, and redirects from
@@ -229,15 +238,45 @@ class ZimReader implements DictionaryReader {
   List<int> _articleIndices = [];
   List<String> _articleTitles = [];
   List<int> _searchOrder = [];
+
+  /// Lowercase NFC sort keys, parallel to [_searchOrder]: element `k` is
+  /// `normalizeKey(articleTitles[_searchOrder[k]]).toLowerCase()`.
+  /// Sorted ascending; lowercase lookups binary-search this list instead of
+  /// keeping a second lowercased map per title.
+  List<String> _searchLowerKeys = [];
   Map<String, int> _titleToIndex = {};
   Map<String, int> _normalizedTitles = {};
-  Map<String, int> _lowerTitles = {};
+
+  /// Canonical path index: one entry per dirent, keyed by full `ns/path`
+  /// only (previously both the bare path and `ns/path` were stored, doubling
+  /// the map). Bare-path callers resolve through [_resolvePathIndex], which
+  /// derives `ns/path` candidates from the namespaces below.
   Map<String, int> _pathToEntryIndex = {};
 
-  // Cluster decompression cache
-  final Map<int, Uint8List> _clusterCache = {};
+  /// Distinct namespaces present in the archive, in first-appearance
+  /// (dirent) order. Bare-path lookups try them in reverse order, mirroring
+  /// the old last-wins behaviour of the dual-keyed map on spec-sorted
+  /// archives (dirents are grouped by namespace, so the last writer was the
+  /// highest namespace).
+  List<String> _namespaces = [];
+
+  // Cluster decompression cache: byte-capped LRU, keyed by cluster number.
+  // Each entry holds the decompressed bytes plus the cluster info byte
+  // (compression type + extended flag), so no separate info-byte map is
+  // needed. [_clusterLru] lists cached clusters oldest first; a hit moves
+  // its cluster to the end. [_clusterCacheBytes] tracks the total
+  // decompressed size so eviction can enforce [_maxClusterCacheBytes].
+  final Map<int, _CachedCluster> _clusterCache = {};
   final List<int> _clusterLru = [];
-  static const int _maxCachedClusters = 16;
+  int _clusterCacheBytes = 0;
+  static const int _maxClusterCacheBytes = 32 * 1024 * 1024;
+
+  /// Cluster numbers currently in the decompression cache, oldest first.
+  /// Exposed so tests can assert on LRU eviction behaviour.
+  List<int> get cachedClusterOrder => List.unmodifiable(_clusterLru);
+
+  /// Total decompressed bytes currently held in the cluster cache.
+  int get cachedClusterBytes => _clusterCacheBytes;
 
   int get majorVersion => _majorVersion;
   int get minorVersion => _minorVersion;
@@ -282,6 +321,36 @@ class ZimReader implements DictionaryReader {
   /// Returns the headword of the [index]-th article.
   @override
   String wordAt(int index) => _articleTitles[index];
+
+  /// Returns the title of the entry at [entryIndex], or `null` when that
+  /// entry is not an article (e.g. a resource or metadata entry).
+  ///
+  /// Purely in-memory: [_articleIndices] is built in ascending entry order
+  /// during index parsing, so a binary search finds the article slot
+  /// without touching the disk. Throws [StateError] before [init] and
+  /// [RangeError] for an out-of-range [entryIndex], like [getEntry].
+  String? entryTitleAt(int entryIndex) {
+    if (!_initialized) {
+      throw StateError('ZimReader.init() has not completed');
+    }
+    if (entryIndex < 0 || entryIndex >= _entryCount) {
+      throw RangeError.range(entryIndex, 0, _entryCount - 1, 'entry index');
+    }
+    var lo = 0;
+    var hi = _articleIndices.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      final value = _articleIndices[mid];
+      if (value < entryIndex) {
+        lo = mid + 1;
+      } else if (value > entryIndex) {
+        hi = mid;
+      } else {
+        return _articleTitles[mid];
+      }
+    }
+    return null;
+  }
 
   /// Reads file header and MIME list without loading the full index.
   Future<void> initMetadata() async {
@@ -333,7 +402,10 @@ class ZimReader implements DictionaryReader {
   /// Initializes the ZIM reader, parsing the index, pointer lists, and metadata.
   ///
   /// Set [useIsolate] to `true` (default) to run the index parsing in a background isolate.
-  Future<void> init({bool useIsolate = true}) async {
+  /// [direntWindowBytes] sizes the sliding window used to read directory
+  /// entries (default 16 MiB); it is a testing knob for exercising the
+  /// windowed path with small values.
+  Future<void> init({bool useIsolate = true, int? direntWindowBytes}) async {
     if (_initialized) return;
 
     await initMetadata();
@@ -342,9 +414,15 @@ class ZimReader implements DictionaryReader {
     // (the reader holds unsendable state such as the file-access lock future,
     // and Isolate.run rejects the whole object graph when it does).
     final filePath = path;
+    final windowBytes = direntWindowBytes ?? _defaultDirentWindowBytes;
     final parsed = useIsolate
-        ? await Isolate.run(() => _parseZimIndex(filePath))
-        : _parseZimIndex(filePath);
+        ? await Isolate.run(
+            () => _parseZimIndex(
+              filePath,
+              direntWindowBytes: windowBytes,
+            ),
+          )
+        : _parseZimIndex(filePath, direntWindowBytes: windowBytes);
 
     _majorVersion = parsed.majorVersion;
     _minorVersion = parsed.minorVersion;
@@ -366,10 +444,11 @@ class ZimReader implements DictionaryReader {
     _articleIndices = parsed.articleIndices;
     _articleTitles = parsed.articleTitles;
     _searchOrder = parsed.searchOrder;
+    _searchLowerKeys = parsed.searchLowerKeys;
     _titleToIndex = parsed.titleToIndex;
     _normalizedTitles = parsed.normalizedTitles;
-    _lowerTitles = parsed.lowerTitles;
     _pathToEntryIndex = parsed.pathToEntryIndex;
+    _namespaces = parsed.namespaces;
 
     _file = await File(path).open(mode: FileMode.read);
     _initialized = true;
@@ -397,19 +476,60 @@ class ZimReader implements DictionaryReader {
       if (normIdx != null) return normIdx;
     }
 
-    // Lowercase spelling
+    // Lowercase spelling: binary-search the precomputed lowercase sort keys.
+    // [_searchLowerKeys] is sorted in [_searchOrder] order, and the sort
+    // breaks key ties by article position, so the leftmost match is the
+    // first article in title order — the same winner the old
+    // putIfAbsent map produced for duplicate lowercase keys.
     final lower = word.toLowerCase();
-    final lowerIdx = _lowerTitles[lower];
+    final lowerIdx = _lowerBoundSearchKey(lower);
     if (lowerIdx != null) return lowerIdx;
 
     final lowerNfc = nfc.toLowerCase();
     if (lowerNfc != lower) {
-      final lowerNfcIdx = _lowerTitles[lowerNfc];
+      final lowerNfcIdx = _lowerBoundSearchKey(lowerNfc);
       if (lowerNfcIdx != null) return lowerNfcIdx;
     }
 
     // Path match (e.g. if queried by path)
-    return _pathToEntryIndex[word];
+    return _resolvePathIndex(word);
+  }
+
+  /// Leftmost binary search of [key] in [_searchLowerKeys]; returns the
+  /// entry index of the first title (in article order) whose lowercase NFC
+  /// key equals [key], or null.
+  int? _lowerBoundSearchKey(String key) {
+    var lo = 0;
+    var hi = _searchLowerKeys.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (_searchLowerKeys[mid].compareTo(key) < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    if (lo < _searchLowerKeys.length && _searchLowerKeys[lo] == key) {
+      return _articleIndices[_searchOrder[lo]];
+    }
+    return null;
+  }
+
+  /// Resolves a path to an entry index against the canonical `ns/path` map.
+  ///
+  /// [path] is tried as a full `ns/path` key first, then as a bare path with
+  /// each namespace present in the archive derived (`ns/path`), in reverse
+  /// first-appearance order. That order mirrors the old dual-keyed map's
+  /// last-wins result on spec-sorted archives; a bare path that exists under
+  /// a single namespace resolves to exactly that entry.
+  int? _resolvePathIndex(String path) {
+    var idx = _pathToEntryIndex[path];
+    if (idx != null) return idx;
+    for (var i = _namespaces.length - 1; i >= 0; i--) {
+      idx = _pathToEntryIndex['${_namespaces[i]}/$path'];
+      if (idx != null) return idx;
+    }
+    return null;
   }
 
   /// Looks up [word] and returns matching entries.
@@ -475,14 +595,13 @@ class ZimReader implements DictionaryReader {
 
     final lowerQuery = normalizeKey(query).toLowerCase();
 
-    // Binary search over _searchOrder
+    // Binary search over _searchOrder via the precomputed lowercase keys
+    // (each probe used to re-normalize and re-lowercase its title).
     var lo = 0;
     var hi = _searchOrder.length;
     while (lo < hi) {
       final mid = (lo + hi) >> 1;
-      final probe =
-          normalizeKey(_articleTitles[_searchOrder[mid]]).toLowerCase();
-      if (probe.compareTo(lowerQuery) < 0) {
+      if (_searchLowerKeys[mid].compareTo(lowerQuery) < 0) {
         lo = mid + 1;
       } else {
         hi = mid;
@@ -494,9 +613,8 @@ class ZimReader implements DictionaryReader {
     for (var i = lo;
         i < _searchOrder.length && results.length < maxResults;
         i++) {
+      if (!_searchLowerKeys[i].startsWith(lowerQuery)) break;
       final title = _articleTitles[_searchOrder[i]];
-      final norm = normalizeKey(title).toLowerCase();
-      if (!norm.startsWith(lowerQuery)) break;
       if (seen.add(title)) {
         results.add(title);
       }
@@ -660,7 +778,9 @@ class ZimReader implements DictionaryReader {
     }
 
     final normalized = _normalizePath(rawPath);
-    var targetIdx = _pathToEntryIndex[normalized];
+    // The path map holds canonical `ns/path` keys only; bare paths resolve
+    // through [_resolvePathIndex], which derives the namespaced candidates.
+    var targetIdx = _resolvePathIndex(normalized);
 
     if (targetIdx == null && currentNamespace != null) {
       targetIdx = _pathToEntryIndex['$currentNamespace/$normalized'];
@@ -670,7 +790,7 @@ class ZimReader implements DictionaryReader {
       try {
         final decoded = Uri.decodeFull(normalized);
         if (decoded != normalized) {
-          targetIdx = _pathToEntryIndex[decoded];
+          targetIdx = _resolvePathIndex(decoded);
           if (targetIdx == null && currentNamespace != null) {
             targetIdx = _pathToEntryIndex['$currentNamespace/$decoded'];
           }
@@ -718,9 +838,17 @@ class ZimReader implements DictionaryReader {
       );
     }
 
-    final decompressed = await _getDecompressedCluster(clusterNumber);
-    final isExtended = _isClusterExtended(clusterNumber);
-    return _extractBlob(decompressed, blobNumber, isExtended);
+    // Reuse the streaming path: uncompressed clusters are read straight
+    // from disk (only this blob's byte range, never the whole cluster),
+    // while compressed clusters go through the decompression cache.
+    // Collecting the stream yields exactly the bytes [_extractBlob] used
+    // to return for the same blob.
+    final stream = await _readBlobStream(clusterNumber, blobNumber);
+    final builder = BytesBuilder();
+    await for (final chunk in stream) {
+      builder.add(chunk);
+    }
+    return builder.takeBytes();
   }
 
   /// Opens a byte stream for reading the blob at [clusterNumber], [blobNumber],
@@ -861,66 +989,84 @@ class ZimReader implements DictionaryReader {
     );
   }
 
+  /// Imports a `.cidx` index produced by [exportCidx].
+  ///
+  /// The deserialization and the rebuild of the derived lookup maps run in
+  /// a worker isolate when the `.cidx` buffer is at least
+  /// [_cidxIsolateThresholdBytes] — at that size the inline parse stalls
+  /// the calling isolate for more than a frame, while the isolate path
+  /// keeps the stall to the message-copy phases; smaller buffers are
+  /// imported inline so a short-lived spawn is not paid for a few
+  /// milliseconds of work. Pass [useIsolate] to force either path (a
+  /// testing knob; `null` means "decide by size").
+  ///
+  /// A stale cache throws [FormatException], exactly as before; no reader
+  /// state is touched when the import fails, so the caller can fall back
+  /// to a full [init].
   @override
-  Future<void> importCidx(Uint8List bytes) async {
+  Future<void> importCidx(
+    Uint8List bytes, {
+    bool? useIsolate,
+  }) async {
     final targetFile = File(path);
-    final deserialized = deserializeZimCidx(bytes, targetFile);
+    // Cheap: one stat call on the calling isolate; the fingerprint values
+    // are all the worker needs to validate the cache.
+    final stat = targetFile.statSync();
+    final runInIsolate =
+        useIsolate ?? bytes.length >= _cidxIsolateThresholdBytes;
+    final imported = runInIsolate
+        ? await Isolate.run(
+            () => _importZimCidx(
+              bytes,
+              stat.size,
+              stat.modified.microsecondsSinceEpoch,
+            ),
+          )
+        : _importZimCidx(
+            bytes,
+            stat.size,
+            stat.modified.microsecondsSinceEpoch,
+          );
 
-    _majorVersion = deserialized.majorVersion;
-    _minorVersion = deserialized.minorVersion;
-    _uuid = deserialized.uuid;
-    _entryCount = deserialized.entryCount;
-    _clusterCount = deserialized.clusterCount;
-    _pathPtrPos = deserialized.pathPtrPos;
-    _titlePtrPos = deserialized.titlePtrPos;
-    _clusterPtrPos = deserialized.clusterPtrPos;
-    _mimeListPos = deserialized.mimeListPos;
-    _mainPage = deserialized.mainPage;
-    _layoutPage = deserialized.layoutPage;
-    _checksumPos = deserialized.checksumPos;
-    _mimeTypes = deserialized.mimeTypes;
-    _metadata = deserialized.metadata;
-    _clusterOffsets = deserialized.clusterOffsets;
-    _pathPointers = deserialized.pathPointers;
-    _titlePointers = deserialized.titlePointers;
-    _articleIndices = deserialized.articleIndices;
-    _articleTitles = deserialized.articleTitles;
-    _searchOrder = deserialized.searchOrder;
-    _pathToEntryIndex = deserialized.pathToEntryIndex;
+    final d = imported.deserialized;
+    _majorVersion = d.majorVersion;
+    _minorVersion = d.minorVersion;
+    _uuid = d.uuid;
+    _entryCount = d.entryCount;
+    _clusterCount = d.clusterCount;
+    _pathPtrPos = d.pathPtrPos;
+    _titlePtrPos = d.titlePtrPos;
+    _clusterPtrPos = d.clusterPtrPos;
+    _mimeListPos = d.mimeListPos;
+    _mainPage = d.mainPage;
+    _layoutPage = d.layoutPage;
+    _checksumPos = d.checksumPos;
+    _mimeTypes = d.mimeTypes;
+    _metadata = d.metadata;
+    _clusterOffsets = d.clusterOffsets;
+    _pathPointers = d.pathPointers;
+    _titlePointers = d.titlePointers;
+    _articleIndices = d.articleIndices;
+    _articleTitles = d.articleTitles;
+    _searchOrder = d.searchOrder;
+    _pathToEntryIndex = d.pathToEntryIndex;
 
-    _titleToIndex.clear();
-    _normalizedTitles.clear();
-    _lowerTitles.clear();
-    for (var i = 0; i < _articleTitles.length; i++) {
-      final title = _articleTitles[i];
-      final entryIdx = _articleIndices[i];
-      _titleToIndex.putIfAbsent(title, () => entryIdx);
-      final norm = normalizeKey(title);
-      _normalizedTitles.putIfAbsent(norm, () => entryIdx);
-      _lowerTitles.putIfAbsent(title.toLowerCase(), () => entryIdx);
-      _lowerTitles.putIfAbsent(norm.toLowerCase(), () => entryIdx);
-    }
+    _titleToIndex = imported.titleToIndex;
+    _normalizedTitles = imported.normalizedTitles;
+    _searchLowerKeys = imported.searchLowerKeys;
+    _namespaces = imported.namespaces;
 
     _file = await targetFile.open(mode: FileMode.read);
     _initialized = true;
     _metadataInitialized = true;
   }
 
-  bool _isClusterExtended(int clusterNumber) {
-    // Info byte bit 4 determines extension
-    final info = _clusterInfoCache[clusterNumber];
-    if (info != null) return (info & 0x10) != 0;
-    return false;
-  }
-
-  final Map<int, int> _clusterInfoCache = {};
-
   Future<Uint8List> _getDecompressedCluster(int clusterNumber) async {
     final cached = _clusterCache[clusterNumber];
     if (cached != null) {
       _clusterLru.remove(clusterNumber);
       _clusterLru.add(clusterNumber);
-      return cached;
+      return cached.bytes;
     }
 
     final offset = _clusterOffsets![clusterNumber];
@@ -946,18 +1092,27 @@ class ZimReader implements DictionaryReader {
     }
 
     final infoByte = clusterData[0];
-    _clusterInfoCache[clusterNumber] = infoByte;
     final decompressed = _decompressCluster(clusterData);
 
-    // Add to LRU cache
-    if (_clusterCache.length >= _maxCachedClusters) {
-      final oldest = _clusterLru.removeAt(0);
-      _clusterCache.remove(oldest);
-    }
-    _clusterCache[clusterNumber] = decompressed;
-    _clusterLru.add(clusterNumber);
-
+    _cacheCluster(clusterNumber, infoByte, decompressed);
     return decompressed;
+  }
+
+  /// Inserts a decompressed cluster into the cache, evicting
+  /// least-recently-used entries until the total cached bytes fit within
+  /// [_maxClusterCacheBytes]. A single cluster larger than the whole
+  /// budget is not cached at all, so the cap is never exceeded.
+  void _cacheCluster(int clusterNumber, int infoByte, Uint8List bytes) {
+    if (bytes.length > _maxClusterCacheBytes) return;
+    while (_clusterCacheBytes + bytes.length > _maxClusterCacheBytes &&
+        _clusterLru.isNotEmpty) {
+      final oldest = _clusterLru.removeAt(0);
+      final evicted = _clusterCache.remove(oldest);
+      if (evicted != null) _clusterCacheBytes -= evicted.bytes.length;
+    }
+    _clusterCache[clusterNumber] = _CachedCluster(bytes, infoByte);
+    _clusterCacheBytes += bytes.length;
+    _clusterLru.add(clusterNumber);
   }
 
   /// Closes the underlying file and releases memory caches.
@@ -970,7 +1125,7 @@ class ZimReader implements DictionaryReader {
         _file = null;
         _clusterCache.clear();
         _clusterLru.clear();
-        _clusterInfoCache.clear();
+        _clusterCacheBytes = 0;
         _initialized = false;
         _metadataInitialized = false;
       });
@@ -1152,6 +1307,80 @@ _RawDirent? _tryParseDirent(Uint8List bytes, int entryIndex) {
   );
 }
 
+class _ImportedZimCidx {
+  final DeserializedZimCidx deserialized;
+  final Map<String, int> titleToIndex;
+  final Map<String, int> normalizedTitles;
+
+  /// Lowercase NFC sort keys parallel to [DeserializedZimCidx.searchOrder].
+  final List<String> searchLowerKeys;
+
+  /// Distinct namespaces in first-appearance (serialized) order.
+  final List<String> namespaces;
+
+  _ImportedZimCidx({
+    required this.deserialized,
+    required this.titleToIndex,
+    required this.normalizedTitles,
+    required this.searchLowerKeys,
+    required this.namespaces,
+  });
+}
+
+/// Deserializes a ZIM `.cidx` buffer and rebuilds the derived lookup maps,
+/// as a top-level function so [ZimReader.importCidx] can run it in a worker
+/// isolate via [Isolate.run]. Only sendable values cross the boundary:
+/// [bytes] plus the two fingerprint integers — the caller stats the file
+/// itself, because a [File] cannot be captured by the isolate closure.
+/// Throws [FormatException] for a stale cache, like [deserializeZimCidx].
+_ImportedZimCidx _importZimCidx(
+  Uint8List bytes,
+  int fileSize,
+  int fileModified,
+) {
+  final deserialized = deserializeZimCidxWithStat(
+    bytes,
+    fileSize: fileSize,
+    fileModified: fileModified,
+  );
+
+  final titleToIndex = <String, int>{};
+  final normalizedTitles = <String, int>{};
+  final articleTitles = deserialized.articleTitles;
+  final articleIndices = deserialized.articleIndices;
+  for (var i = 0; i < articleTitles.length; i++) {
+    final title = articleTitles[i];
+    final entryIdx = articleIndices[i];
+    titleToIndex.putIfAbsent(title, () => entryIdx);
+    final norm = normalizeKey(title);
+    normalizedTitles.putIfAbsent(norm, () => entryIdx);
+  }
+
+  // Rebuild the lowercase sort keys from the serialized titles and search
+  // order (same precomputation the scanner performs); no extra section is
+  // stored in the .cidx, so the format — and its version — is unchanged.
+  final searchLowerKeys = [
+    for (final articlePos in deserialized.searchOrder)
+      normalizeKey(articleTitles[articlePos]).toLowerCase(),
+  ];
+
+  // The .cidx stores canonical `ns/path` keys only; recover the distinct
+  // namespaces from them (in serialized order) for bare-path lookups.
+  final namespaces = <String>{};
+  for (final key in deserialized.pathToEntryIndex.keys) {
+    final slash = key.indexOf('/');
+    if (slash > 0) namespaces.add(key.substring(0, slash));
+  }
+
+  return _ImportedZimCidx(
+    deserialized: deserialized,
+    titleToIndex: titleToIndex,
+    normalizedTitles: normalizedTitles,
+    searchLowerKeys: searchLowerKeys,
+    namespaces: namespaces.toList(),
+  );
+}
+
 class _ParsedZimIndex {
   final int majorVersion;
   final int minorVersion;
@@ -1175,10 +1404,15 @@ class _ParsedZimIndex {
   final List<int> articleIndices;
   final List<String> articleTitles;
   final List<int> searchOrder;
+
+  /// Lowercase NFC sort keys parallel to [searchOrder] (see [_parseZimIndex]).
+  final List<String> searchLowerKeys;
   final Map<String, int> titleToIndex;
   final Map<String, int> normalizedTitles;
-  final Map<String, int> lowerTitles;
   final Map<String, int> pathToEntryIndex;
+
+  /// Distinct namespaces in first-appearance (dirent) order.
+  final List<String> namespaces;
 
   _ParsedZimIndex({
     required this.majorVersion,
@@ -1201,14 +1435,36 @@ class _ParsedZimIndex {
     required this.articleIndices,
     required this.articleTitles,
     required this.searchOrder,
+    required this.searchLowerKeys,
     required this.titleToIndex,
     required this.normalizedTitles,
-    required this.lowerTitles,
     required this.pathToEntryIndex,
+    required this.namespaces,
   });
 }
 
-_ParsedZimIndex _parseZimIndex(String filePath) {
+/// Default size of the sliding window [_parseZimIndex] uses to read
+/// directory entries: 16 MiB of contiguous bytes per window.
+const int _defaultDirentWindowBytes = 16 * 1024 * 1024;
+
+/// `.cidx` buffers at least this large are imported in a worker isolate
+/// instead of on the calling isolate ([ZimReader.importCidx]).
+///
+/// Measured on synthetic `.cidx` buffers (JIT, sandbox, 1.5 shared CPUs;
+/// min-of-9 wall times, worst-of-3 event-loop stalls): the inline parse
+/// stalls the calling isolate for ~22 ms at 232 KiB, ~150 ms at 2.4 MiB
+/// and ~370 ms at 4.9 MiB, while the isolate path keeps the stall to the
+/// message-copy phases (single-digit ms up to ~2.4 MiB) at comparable
+/// total wall time (within ~30%). 256 KiB sits just above the size where
+/// the inline stall first exceeds one 60 fps frame (~16 ms), so small
+/// dictionaries skip the isolate spawn and large ones never freeze the
+/// calling isolate.
+const int _cidxIsolateThresholdBytes = 256 * 1024;
+
+_ParsedZimIndex _parseZimIndex(
+  String filePath, {
+  int direntWindowBytes = _defaultDirentWindowBytes,
+}) {
   final f = File(filePath).openSync(mode: FileMode.read);
   try {
     f.setPositionSync(0);
@@ -1277,57 +1533,92 @@ _ParsedZimIndex _parseZimIndex(String filePath) {
       }
     }
 
-    // Read and parse all directory entries
-    // Usually directory entries are stored contiguously before pathPtrPos.
-    final firstEntryOffset = entryCount > 0 ? pathPointers[0] : 0;
-    final lastEntryOffset = entryCount > 0 ? pathPointers[entryCount - 1] : 0;
-    Uint8List? contiguousBuffer;
+    // Read and parse all directory entries.
+    // Directory entries are usually stored contiguously before pathPtrPos,
+    // so they are read through a sliding window of [windowSize] bytes
+    // instead of one up-to-100 MiB blob (old behaviour below that span) or
+    // one syscall per dirent (old behaviour past it). A dirent straddling
+    // the end of a window is retried from a window slid to its own offset;
+    // a dirent longer than one window falls back to a bounded direct read.
+    final windowSize =
+        direntWindowBytes > 0 ? direntWindowBytes : _defaultDirentWindowBytes;
+    final fileLen = f.lengthSync();
+    var windowStart = -1;
+    var windowEnd = -1;
+    Uint8List? windowBuffer;
 
-    if (entryCount > 0 &&
-        lastEntryOffset >= firstEntryOffset &&
-        (lastEntryOffset - firstEntryOffset) < 100 * 1024 * 1024) {
-      final totalSpan = (lastEntryOffset - firstEntryOffset) + 4096;
-      f.setPositionSync(firstEntryOffset);
-      contiguousBuffer = f.readSync(totalSpan);
+    void loadWindowAt(int start) {
+      windowStart = start;
+      f.setPositionSync(start);
+      windowBuffer = f.readSync(windowSize);
+      windowEnd = windowStart + windowBuffer!.length;
     }
 
     final articleIndices = <int>[];
     final articleTitles = <String>[];
+
+    /// Lowercase NFC sort key per article, parallel to [articleTitles].
+    final lowerKeys = <String>[];
     final titleToIndex = <String, int>{};
     final normalizedTitles = <String, int>{};
-    final lowerTitles = <String, int>{};
+
+    /// Canonical `ns/path` -> entry index, one key per dirent.
     final pathToEntryIndex = <String, int>{};
+    final namespaceSet = <String>{};
     final metadataEntries = <(String key, int cluster, int blob)>[];
 
     for (var i = 0; i < entryCount; i++) {
       final offset = pathPointers[i];
       _RawDirent? dirent;
 
-      if (contiguousBuffer != null) {
-        final rel = offset - firstEntryOffset;
-        if (rel >= 0 && rel < contiguousBuffer.length) {
-          dirent = _tryParseDirent(
-            Uint8List.sublistView(contiguousBuffer, rel),
-            i,
-          );
+      if (windowBuffer != null && offset >= windowStart && offset < windowEnd) {
+        dirent = _tryParseDirent(
+          Uint8List.sublistView(windowBuffer!, offset - windowStart),
+          i,
+        );
+      }
+
+      if (dirent == null) {
+        // Slide the window to this dirent and retry: covers the first load,
+        // a dirent past the previous window, and one straddling its end.
+        loadWindowAt(offset);
+        if (windowBuffer!.isNotEmpty) {
+          dirent = _tryParseDirent(windowBuffer!, i);
         }
       }
 
       if (dirent == null) {
+        // Dirent longer than one window (or unparseable from the window):
+        // read it directly, bounded by the next dirent when the pointers
+        // are ascending — or by the end of the dirent region for the last
+        // entry — so even a multi-megabyte title is read exactly once.
         f.setPositionSync(offset);
-        final buf = f.readSync(256);
-        dirent = _tryParseDirent(buf, i);
+        dirent = _tryParseDirent(f.readSync(256), i);
         if (dirent == null) {
           f.setPositionSync(offset);
           dirent = _tryParseDirent(f.readSync(2048), i);
+        }
+        if (dirent == null) {
+          var bound = -1;
+          if (i + 1 < entryCount && pathPointers[i + 1] > offset) {
+            bound = pathPointers[i + 1] - offset;
+          } else if (pathPtrPos > offset) {
+            bound = pathPtrPos - offset;
+          }
+          if (bound > fileLen - offset) bound = fileLen - offset;
+          if (bound > 2048) {
+            f.setPositionSync(offset);
+            dirent = _tryParseDirent(f.readSync(bound), i);
+          }
         }
       }
 
       if (dirent == null) continue;
 
       final fullPath = '${dirent.namespace}/${dirent.path}';
-      pathToEntryIndex[dirent.path] = i;
+      // Canonical key only: the bare path is derivable from [_namespaces].
       pathToEntryIndex[fullPath] = i;
+      namespaceSet.add(dirent.namespace);
 
       if (dirent.namespace == 'M') {
         metadataEntries
@@ -1359,25 +1650,33 @@ _ParsedZimIndex _parseZimIndex(String filePath) {
         articleIndices.add(i);
         articleTitles.add(dirent.title);
 
-        titleToIndex.putIfAbsent(dirent.title, () => i);
+        // Precompute the lowercase NFC sort key once per title: the
+        // search-order sort and every later binary search reuse it instead
+        // of re-normalizing and re-lowercasing on each comparison.
         final nfc = normalizeKey(dirent.title);
+        lowerKeys.add(nfc.toLowerCase());
+
+        titleToIndex.putIfAbsent(dirent.title, () => i);
         if (nfc != dirent.title) {
           normalizedTitles.putIfAbsent(nfc, () => i);
-        }
-        lowerTitles.putIfAbsent(dirent.title.toLowerCase(), () => i);
-        if (nfc != dirent.title) {
-          lowerTitles.putIfAbsent(nfc.toLowerCase(), () => i);
         }
       }
     }
 
-    // Search order: indices into articleTitles, sorted by lowercase NFC title
+    // Search order: indices into articleTitles, sorted by the precomputed
+    // lowercase NFC keys. Ties break by article position, so equal keys keep
+    // title order (the same winner the old putIfAbsent lowercase map
+    // produced for duplicate keys).
     final searchOrder = List<int>.generate(articleTitles.length, (i) => i)
       ..sort((a, b) {
-        final ta = normalizeKey(articleTitles[a]).toLowerCase();
-        final tb = normalizeKey(articleTitles[b]).toLowerCase();
-        return ta.compareTo(tb);
+        final cmp = lowerKeys[a].compareTo(lowerKeys[b]);
+        return cmp != 0 ? cmp : a.compareTo(b);
       });
+
+    // Lowercase keys in search order, persisted for binary search.
+    final searchLowerKeys = [
+      for (final articlePos in searchOrder) lowerKeys[articlePos],
+    ];
 
     // Read metadata blobs
     final metadata = <String, String>{};
@@ -1428,10 +1727,11 @@ _ParsedZimIndex _parseZimIndex(String filePath) {
       articleIndices: articleIndices,
       articleTitles: articleTitles,
       searchOrder: searchOrder,
+      searchLowerKeys: searchLowerKeys,
       titleToIndex: titleToIndex,
       normalizedTitles: normalizedTitles,
-      lowerTitles: lowerTitles,
       pathToEntryIndex: pathToEntryIndex,
+      namespaces: namespaceSet.toList(),
     );
   } finally {
     f.closeSync();

@@ -241,6 +241,25 @@ class DeserializedZimCidx {
 
 /// Parses and validates a ZIM `.cidx` buffer against the file on disk.
 DeserializedZimCidx deserializeZimCidx(Uint8List bytes, File targetFile) {
+  final stat = targetFile.statSync();
+  return deserializeZimCidxWithStat(
+    bytes,
+    fileSize: stat.size,
+    fileModified: stat.modified.microsecondsSinceEpoch,
+  );
+}
+
+/// Parses and validates a ZIM `.cidx` buffer against the expected size and
+/// modification time of the file it was exported from.
+///
+/// Unlike [deserializeZimCidx] this takes the fingerprint as plain values,
+/// so callers that already hold the stat — and worker isolates, which
+/// cannot receive a [File] — can validate without touching the disk.
+DeserializedZimCidx deserializeZimCidxWithStat(
+  Uint8List bytes, {
+  required int fileSize,
+  required int fileModified,
+}) {
   if (bytes.length < 80) {
     throw const FormatException('Truncated ZIM .cidx file');
   }
@@ -277,9 +296,7 @@ DeserializedZimCidx deserializeZimCidx(Uint8List bytes, File targetFile) {
   final expectedModified = bd.getInt64(pos, Endian.big);
   pos += 8;
 
-  final stat = targetFile.statSync();
-  if (stat.size != expectedSize ||
-      stat.modified.microsecondsSinceEpoch != expectedModified) {
+  if (fileSize != expectedSize || fileModified != expectedModified) {
     throw const FormatException(
         'Stale ZIM .cidx: file size or timestamp mismatch');
   }
