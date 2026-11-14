@@ -3,6 +3,29 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [1.7.0](https://github.com/mumu-lhl/dict_reader/compare/v1.6.1..v1.7.0) - 2026-11-18
+
+### Features
+
+- Add a StarDict reader with dictzip support and a unified reader interface across MDX/MDD, StarDict, and ZIM.
+- Add binary `.cidx` caching, Unicode normalization, and improved lookup and suggestion paths.
+- Add ZIM support with full-text search, media streaming/range access, redirects, and XHTML article indexing.
+- Expose MDX block compression metadata.
+
+### Bug Fixes
+
+- Support gzip-compressed StarDict indexes and dictzipped synonym indexes.
+- Improve concurrent file reads and harden StarDict and ZIM lookup behavior.
+
+### Performance
+
+- Build lookup indexes in isolates and use in-place binary search for StarDict indexes.
+
+### Tests
+
+- Add extensive coverage for StarDict, ZIM, normalization, caching, and concurrent reads.
+
+---
 ## [1.6.1](https://github.com/cocogitto/cocogitto/compare/v1.6.0..v1.6.1) - 2026-08-28
 
 ### Bug Fixes
