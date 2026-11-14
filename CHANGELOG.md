@@ -3,6 +3,23 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [1.7.1](https://github.com/mumu-lhl/dict_reader/compare/v1.7.0..v1.7.1) - 2026-11-18
+
+### Bug Fixes
+
+- Fix DictZip header overflow and improve keystroke/index parsing.
+- Correct StarDict and ZIM lookup, sorting, and cluster handling.
+
+### Performance
+
+- Add StarDict `.cidx` support and move ZIM `.cidx` import into a worker isolate.
+- Reduce memory use during StarDict and ZIM operations.
+
+### Tests
+
+- Expand StarDict and ZIM regression coverage.
+
+---
 ## [1.7.0](https://github.com/mumu-lhl/dict_reader/compare/v1.6.1..v1.7.0) - 2026-11-18
 
 ### Features
