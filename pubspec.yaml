@@ -12,7 +12,7 @@ dev_dependencies:
 
 dependencies:
   charset: ^2.0.1
-  blockchain_utils: ">=3.4.0 <8.0.0"
+  blockchain_utils: ">=3.4.0 <9.0.0"
   collection: ^1.19.1
   html_unescape: ^2.0.0
   unorm_dart: ^0.3.3
